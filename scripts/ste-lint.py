@@ -14,7 +14,8 @@ Usage:
     ste-lint.py --selftest
 
 Exit 1 when hard ("advisory-free") violations exceed the baseline (default 0).
-Advisory findings (passive voice, compound tenses) never fail the run.
+Advisory findings (passive voice, compound tenses, em dashes, technical phrasal
+verbs) never fail the run.
 Exit 2 on a usage error (unknown flag, bad value, unknown rule, unreadable file).
 """
 import argparse
@@ -89,6 +90,28 @@ def _particle_re(particles):
     return "(?:" + "|".join(alternatives) + ")"
 
 
+# Phrasal verbs that are also technical terms: "set up", "back up", "shut down".
+# They can be correct, so the rule is advisory. A pronoun can stand between the
+# verb and the particle ("sets it up").
+TECHNICAL_PAIRS = [
+    ("set|sets|setting", "up"),
+    ("fall|falls|falling|fell|fallen", "back"),
+    ("back|backs|backed|backing", "up"),
+    ("turn|turns|turned|turning", "on|off"),
+    ("shut|shuts|shutting", "down"),
+    ("pick|picks|picked|picking", "up"),
+    ("hand|hands|handed|handing", "off|over|on|back"),
+    ("rule|rules|ruled|ruling", "out"),
+    ("fill|fills|filled|filling", "in"),
+    ("carry|carries|carried|carrying", "on"),
+    ("give|gives|gave|giving|given", "back"),
+]
+PHRASAL_VERB_TECHNICAL = re.compile(
+    r"\b(?:" + "|".join(
+        rf"(?:{forms})(?:\s+(?:it|them|this|that|these|those))?\s+(?:{particles})"
+        for forms, particles in TECHNICAL_PAIRS)
+    + r")\b", re.I)
+
 PHRASAL_VERB_PARTICLE = re.compile(
     r"\b(?:" + "|".join(
         rf"(?:{forms})\s+(?:(?:it|them|this|that|these|those)\s+)?"
@@ -109,6 +132,9 @@ RULES = [
     ("phrasal-verb-particle", "advisory-free",
      PHRASAL_VERB_PARTICLE,
      "Phrasal verb (Rule 9.3). Use one plain verb (move, return, leave, decrease)."),
+    ("phrasal-verb-technical", "advisory",
+     PHRASAL_VERB_TECHNICAL,
+     "Possible phrasal verb (Rule 9.3). If it is not a fixed technical term, use one plain verb."),
     ("marketing-adjective", "advisory-free",
      re.compile(r"\b(seamless(?:ly)?|robust(?:ly)?|cutting-edge|effortless(?:ly)?|blazing[- ]fast|world-class|state-of-the-art|game-chang(?:ing|er))\b", re.I),
      "Marketing adjective. Delete, or replace with the measurement that earns the claim."),
@@ -122,6 +148,10 @@ RULES = [
      # modal + perfect infinitive ("may have failed") is a protected hedge, not present perfect
      re.compile(r"(?<!\bmay )(?<!\bmight )(?<!\bcould )(?<!\bshould )(?<!\bwould )(?<!\bmust )\b(has|have|had)\s+(?:been\s+)?(?:\w+(?:ed|en)|" + IRREGULAR_PARTICIPLES + r")\b", re.I),
      "Compound tense. Use simple past/present unless current relevance is the point (then keep and flag)."),
+    # STE does not ban the em dash (Rule 8.1), but it often joins two ideas.
+    ("em-dash", "advisory",
+     re.compile(r"(?<=\S)\s*—\s*(?=\S)"),
+     "Em dash joins two ideas (run-on). Consider two sentences, a colon, or parentheses."),
 ]
 
 # One word, one meaning: groups of verbs commonly rotated for the same action.
@@ -2055,20 +2085,27 @@ def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES, max_words=MAX_WO
         nonlocal words_total
         words_total += len(line.split())
         lead = block[-1][2] + " " if block else ""  # the line before, in this paragraph
-        soft = []  # the (start, end) of each soft phrasal verb on the line
+        phrasal = []  # the (start, end) of each phrasal-verb finding on the line
         for rule_id, level, pattern, msg in RULES:
+            # One phrasal verb gives one finding. RULES has the soft list first, then the
+            # particle rule, then the technical rule. The spans of the earlier rules do
+            # not overlap, so the span with the last start before a match end is the
+            # only one that can overlap the match.
+            earlier = sorted(phrasal)
+            earlier_starts = [start for start, _ in earlier]
             for m in pattern.finditer(line):
                 # the modal may end the line before: "may" / "have failed"
                 if (rule_id == "present-perfect"
                         and MODAL_PERFECT_PREFIX.search(lead + line[skip:m.start()])):
                     continue
-                if rule_id == "phrasal-verb":
-                    soft.append(m.span())
-                # One phrasal verb gives one finding: the soft list comes first in RULES.
-                if rule_id == "phrasal-verb-particle" and (
-                        NOUN_CUE.search(_text_before(lead, line, m.start()))
-                        or any(start < m.end() and m.start() < end for start, end in soft)):
-                    continue
+                if rule_id.startswith("phrasal-verb"):
+                    index = bisect.bisect_left(earlier_starts, m.end()) - 1
+                    if index >= 0 and earlier[index][1] > m.start():
+                        continue
+                    if (rule_id == "phrasal-verb-particle"
+                            and NOUN_CUE.search(_text_before(lead, line, m.start()))):
+                        continue
+                    phrasal.append(m.span())
                 findings.append({"file": filename, "line": lineno,
                                  "col": source_column + m.start() + 1,
                                  "rule": rule_id, "level": level,
@@ -3630,6 +3667,19 @@ def selftest():
     # max_words sets the cap of the long-sentence rule.
     findings, _ = lint(words + ".", max_words=30)
     assert not any(f["rule"] == "long-sentence" for f in findings), findings
+    # An em dash between two words is advisory. A dash alone in a table cell is no join.
+    findings, _ = lint("One idea — and another.\n\n| a | b |\n| --- | --- |\n| — | x |")
+    assert [(f["rule"], f["line"], f["level"]) for f in findings] == [("em-dash", 1, "advisory")], findings
+    # A technical phrasal verb is advisory, also with a pronoun between its words. Where
+    # another phrasal rule matches the same words, only that rule gives a finding.
+    findings, _ = lint("Set it up. Turn it off. Given back. We back up the data. "
+                       "The origin does not come back up.")
+    assert [(f["rule"], f["match"], f["level"]) for f in findings if f["rule"].startswith("phrasal")] == [
+        ("phrasal-verb-technical", "Set it up", "advisory"),
+        ("phrasal-verb-technical", "Turn it off", "advisory"),
+        ("phrasal-verb-technical", "Given back", "advisory"),
+        ("phrasal-verb-technical", "back up", "advisory"),
+        ("phrasal-verb-particle", "come back up", "advisory-free")], findings
     print("selftest OK")
 
 
