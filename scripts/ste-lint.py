@@ -84,6 +84,7 @@ SYNONYM_GROUPS = [
 ]
 
 MAX_WORDS = 25  # descriptions cap; instructions cap is 20 but undetectable without context
+MAX_SENTENCES = 6  # the sentences of one paragraph (SKILL.md "Paragraph limits")
 
 CODE_FENCE = re.compile(r"^(`{3,}|~{3,})")
 INLINE_CODE = re.compile(r"`[^`]*`")
@@ -957,8 +958,8 @@ def _sentence_starts(text, view=None, emphasis=None):
     return starts
 
 
-def _long_sentence_findings(pieces, filename, emphasis=None):
-    """Flag long sentences in one prose block.
+def _sentence_findings(pieces, filename, emphasis=None, max_sentences=MAX_SENTENCES):
+    """Flag long sentences, and a paragraph with too many sentences, in one prose block.
 
     pieces is a list of (lineno, source_column, text, view, ...) tuples. TEXT is the
     line with code spans and links masked. VIEW is the line as _emphasis_view
@@ -966,6 +967,9 @@ def _long_sentence_findings(pieces, filename, emphasis=None):
     sentence wrapped across source lines is counted once, and each finding
     points at the line and column where it starts. EMPHASIS holds the end
     offsets of the runs that emphasis uses in the joined views, or None.
+    A block is one paragraph, so the long-paragraph finding counts the
+    sentences of the block that hold a word, and it points at the first word.
+    A block of a table cell or a heading is no paragraph (piece[7] is True).
     """
     offsets, position = [], 0
     for piece in pieces:
@@ -974,19 +978,27 @@ def _long_sentence_findings(pieces, filename, emphasis=None):
     joined = " ".join(piece[2] for piece in pieces)
     view = " ".join(piece[3] for piece in pieces)
     findings = []
-    starts = _sentence_starts(joined, view, emphasis)
-    for start, end in zip(starts, starts[1:] + [len(joined)]):
-        n = _count_words(joined[start:end])
-        if n <= MAX_WORDS:
-            continue
+
+    def add(start, rule_id, match, message):
         index = bisect.bisect_right(offsets, start) - 1
-        offset = offsets[index]
         lineno, source_column = pieces[index][:2]
         findings.append({"file": filename, "line": lineno,
-                         "col": source_column + start - offset + 1,
-                         "rule": "long-sentence", "level": "advisory-free",
-                         "match": f"{n} words",
-                         "message": f"Sentence has {n} words (cap {MAX_WORDS}). Split it."})
+                         "col": source_column + start - offsets[index] + 1,
+                         "rule": rule_id, "level": "advisory-free",
+                         "match": match, "message": message})
+
+    starts = _sentence_starts(joined, view, emphasis)
+    sentences = 0
+    for start, end in zip(starts, starts[1:] + [len(joined)]):
+        n = _count_words(joined[start:end])
+        sentences += n > 0
+        if n > MAX_WORDS:
+            add(start, "long-sentence", f"{n} words",
+                f"Sentence has {n} words (cap {MAX_WORDS}). Split it.")
+    if sentences > max_sentences and not pieces[0][7]:
+        add(starts[0], "long-paragraph", f"{sentences} sentences",
+            f"Paragraph has {sentences} sentences (cap {max_sentences}). "
+            "Split it: one topic in each paragraph.")
     return findings
 
 
@@ -1881,7 +1893,7 @@ def _front_matter(text):
     return "\n" * (end + 1) + "\n".join(lines[end + 1:]), pieces
 
 
-def lint(text, filename="<stdin>"):
+def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES):
     text, description = _front_matter(text)
     findings = []
     words_total = 0
@@ -1930,7 +1942,9 @@ def lint(text, filename="<stdin>"):
         block.clear()
 
     def check(lineno, segment, source_column, line, skip, is_table,
-              add_to_block=True, hidden=(), wraps=False, unsure=False):
+              add_to_block=True, hidden=(), wraps=False, unsure=False, no_paragraph=False):
+        """Lint one line. NO_PARAGRAPH: the line is a block that is no paragraph
+        (a table cell or a heading), so the long-paragraph rule skips it."""
         nonlocal words_total
         words_total += len(line.split())
         for rule_id, level, pattern, msg in RULES:
@@ -1957,7 +1971,8 @@ def lint(text, filename="<stdin>"):
         # This flag affects sentence blocks only; rule checks still scan the line.
         if add_to_block and line[skip:].strip():
             block.append((lineno, source_column + skip, line[skip:],
-                          _emphasis_view(segment, line, hidden)[skip:], paragraph, wraps, unsure))
+                          _emphasis_view(segment, line, hidden)[skip:], paragraph, wraps, unsure,
+                          no_paragraph))
 
     # The description in the front matter is one paragraph of prose.
     span = 0
@@ -2199,7 +2214,7 @@ def lint(text, filename="<stdin>"):
                 lineno, segment, source_column, line, skip, is_table,
                 add_to_block=not admonition_title, hidden=hidden,
                 wraps=not (in_html or is_table) and _html_item_wraps(segment, line, hidden, skip),
-                unsure=unsure or unsure_list,
+                unsure=unsure or unsure_list, no_paragraph=is_table or bool(standalone),
             )
             if is_table:
                 flush()  # each table cell is its own block
@@ -2209,7 +2224,7 @@ def lint(text, filename="<stdin>"):
             flush()
     flush()
     for prose, emphasis in zip(blocks, _block_emphasis(blocks)):
-        findings.extend(_long_sentence_findings(prose, filename, emphasis))
+        findings.extend(_sentence_findings(prose, filename, emphasis, max_sentences))
     # synonym rotation: flag each member after the first, at its first occurrence
     for gi, group in enumerate(SYNONYM_GROUPS):
         present = [(seen_synonyms[(gi, b)], b) for b in group if (gi, b) in seen_synonyms]
@@ -3312,6 +3327,12 @@ def selftest():
             assert main([paths[0], "--json", "--disable", "semicolon",
                          "--disable", "long-sentence"]) == 0
         assert json.loads(out.getvalue())["count"] == 0, out.getvalue()
+        # --max-sentences sets the cap of the long-paragraph rule
+        with open(paths[0], "w", encoding="utf-8") as fh:
+            fh.write("One. Two. Three. Four. Five. Six. Seven.\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert main([paths[0]]) == 1
+            assert main([paths[0], "--max-sentences", "7"]) == 0
         # a file that is not valid UTF-8 is unreadable: exit 2, no traceback
         bad_path = os.path.join(tmp, "bad.md")
         with open(bad_path, "wb") as fh:
@@ -3328,7 +3349,8 @@ def selftest():
         assert "bad.md" in message and "Traceback" not in message, message
     # command-line parsing rejects typos and bad values
     for bad in (["--basline", "3"], ["--baseline"], ["--baseline", "x"],
-                ["--baseline", "-1"], ["--disable", "passive"], ["--base", "3"]):
+                ["--baseline", "-1"], ["--disable", "passive"], ["--base", "3"],
+                ["--max-sentences", "0"], ["--max-sentences", "x"]):
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 main(bad)
@@ -3371,11 +3393,38 @@ def selftest():
     # Inline math holds no prose. A price is no math.
     findings, _ = lint("Use $a;b$ here. It costs $5; or $10.")
     assert [(f["rule"], f["col"]) for f in findings] == [("semicolon", 28)], findings
+    # A paragraph has six sentences at most. The finding is at its first word.
+    seven = "One. Two. Three. Four. Five. Six. Seven."
+    findings, _ = lint(seven)
+    paragraph = [f for f in findings if f["rule"] == "long-paragraph"]
+    assert [(f["line"], f["col"], f["match"], f["level"]) for f in paragraph] == [
+        (1, 1, "7 sentences", "advisory-free")], findings
+    findings, _ = lint("One. Two. Three. Four. Five. Six.")
+    assert not any(f["rule"] == "long-paragraph" for f in findings), findings
+    findings, _ = lint(seven, max_sentences=7)
+    assert not any(f["rule"] == "long-paragraph" for f in findings), findings
+    # A wrapped paragraph counts once. A blank line, a list item and a quote end it.
+    findings, _ = lint("One. Two. Three.\nFour. Five. Six.\nSeven.")
+    assert [f["line"] for f in findings if f["rule"] == "long-paragraph"] == [1], findings
+    for text in ("One. Two. Three. Four.\n\nFive. Six. Seven. Eight.",
+                 "- One. Two. Three. Four.\n- Five. Six. Seven. Eight.",
+                 "One. Two. Three. Four.\n> Five. Six. Seven. Eight."):
+        findings, _ = lint(text)
+        assert not any(f["rule"] == "long-paragraph" for f in findings), (text, findings)
+    findings, _ = lint("- Item.\n\n  > " + seven)
+    assert [(f["line"], f["col"]) for f in findings if f["rule"] == "long-paragraph"] == [(3, 5)], findings
+    # A table cell and a heading are no paragraphs.
+    for text in ("| A | B |\n|---|---|\n| " + seven + " | x |", "# " + seven):
+        findings, _ = lint(text)
+        assert not any(f["rule"] == "long-paragraph" for f in findings), (text, findings)
+    # An abbreviation ends no sentence.
+    findings, _ = lint("Use a tool, e.g. the linter. Two. Three. Four. Five. Six.")
+    assert not any(f["rule"] == "long-paragraph" for f in findings), findings
     print("selftest OK")
 
 
 RULE_IDS = {rule_id for rule_id, *_ in RULES} | {
-    "long-sentence", "synonym-rotation", "dangling-conjunction"}
+    "long-sentence", "long-paragraph", "synonym-rotation", "dangling-conjunction"}
 
 
 def _rule_list(value):
@@ -3398,6 +3447,13 @@ def _non_negative_int(value):
     return n
 
 
+def _positive_int(value):
+    n = _non_negative_int(value)
+    if n == 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return n
+
+
 def main(argv):
     parser = argparse.ArgumentParser(
         prog="ste-lint.py", allow_abbrev=False,
@@ -3410,6 +3466,9 @@ def main(argv):
     parser.add_argument("--disable", type=_rule_list, action="append", default=[],
                         metavar="RULES",
                         help="comma-separated rule IDs to silence; may be repeated")
+    parser.add_argument("--max-sentences", type=_positive_int, default=MAX_SENTENCES,
+                        metavar="N",
+                        help=f"the sentences of one paragraph, at most (default {MAX_SENTENCES})")
     parser.add_argument("--selftest", action="store_true", help="run the built-in tests")
     # intermixed parsing keeps flags valid between file paths
     args = parser.parse_intermixed_args(argv)
@@ -3430,11 +3489,11 @@ def main(argv):
             except UnicodeDecodeError as e:
                 # A file that is not valid UTF-8 is unreadable.
                 parser.error(f"cannot read {p}: {e}")
-            f, w = lint(text, filename=p)
+            f, w = lint(text, filename=p, max_sentences=args.max_sentences)
             findings.extend(f)
             words_total += w
     else:
-        findings, words_total = lint(sys.stdin.read())
+        findings, words_total = lint(sys.stdin.read(), max_sentences=args.max_sentences)
 
     findings = [f for f in findings if f["rule"] not in disabled]
     hard_count = sum(1 for f in findings if f["level"] == "advisory-free")
