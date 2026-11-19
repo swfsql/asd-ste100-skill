@@ -11,6 +11,7 @@ Usage:
     ste-lint.py --baseline 5 FILE      # pass unless hard violations exceed 5
     ste-lint.py --disable passive-voice,present-perfect FILE
     ste-lint.py --summary FILE ...     # one line per file, the worst file first
+    ste-lint.py --enable history FILE  # opt-in rules (see OPTIONAL_RULES)
     ste-lint.py --selftest
 
 Exit 1 when hard ("advisory-free") violations exceed the baseline (default 0).
@@ -152,6 +153,15 @@ RULES = [
     ("em-dash", "advisory",
      re.compile(r"(?<=\S)\s*—\s*(?=\S)"),
      "Em dash joins two ideas (run-on). Consider two sentences, a colon, or parentheses."),
+]
+
+# Opt-in rules (--enable NAME). They are not STE rules: they are house rules that
+# often come with STE rewrites of documentation.
+OPTIONAL_RULES = [
+    ("history", "advisory-free",
+     re.compile(r"\b(no longer|used to (?:be|have)|previously|formerly|any ?more|currently|as of now|nowadays|originally"
+                r"|(?:was|were|has been|have been) (?:renamed|replaced|removed|changed|added)|an? (?:earlier|older|previous) version)\b", re.I),
+     "Change history in a description of the current state. Describe what is, not what changed."),
 ]
 
 # One word, one meaning: groups of verbs commonly rotated for the same action.
@@ -2030,7 +2040,10 @@ def _front_matter(text):
     return "\n" * (end + 1) + "\n".join(lines[end + 1:]), pieces
 
 
-def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES, max_words=MAX_WORDS):
+def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES, max_words=MAX_WORDS,
+         enabled=()):
+    """Return (findings, words) for TEXT. ENABLED holds the IDs of the opt-in rules to run."""
+    rules = RULES + [rule for rule in OPTIONAL_RULES if rule[0] in enabled]
     text, description = _front_matter(text)
     findings = []
     words_total = 0
@@ -2086,7 +2099,7 @@ def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES, max_words=MAX_WO
         words_total += len(line.split())
         lead = block[-1][2] + " " if block else ""  # the line before, in this paragraph
         phrasal = []  # the (start, end) of each phrasal-verb finding on the line
-        for rule_id, level, pattern, msg in RULES:
+        for rule_id, level, pattern, msg in rules:
             # One phrasal verb gives one finding. RULES has the soft list first, then the
             # particle rule, then the technical rule. The spans of the earlier rules do
             # not overlap, so the span with the last start before a match end is the
@@ -3519,6 +3532,14 @@ def selftest():
         assert [line.split() for line in lines[1:3]] == [
             ["2", "1", "7", paths[1]], ["1", "0", "30", paths[0]]], lines
         assert lines[4].split() == ["0", "1", "7", paths[1]], lines
+        # --enable turns on an opt-in rule, and repeated flags add up
+        with open(paths[1], "w", encoding="utf-8") as fh:
+            fh.write("It no longer runs.\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert main([paths[1]]) == 0
+            assert main(["--enable", "history", paths[1]]) == 1
+            assert main(["--enable", "history", "--enable", "history", "--disable", "history",
+                         paths[1]]) == 0
         # a closed pipe ends the run without a traceback
         with open(paths[0], "w", encoding="utf-8") as fh:
             fh.write("a; b.\n" * 3000)
@@ -3547,7 +3568,8 @@ def selftest():
     # command-line parsing rejects typos and bad values
     for bad in (["--basline", "3"], ["--baseline"], ["--baseline", "x"],
                 ["--baseline", "-1"], ["--disable", "passive"], ["--base", "3"],
-                ["--max-sentences", "0"], ["--max-sentences", "x"], ["--max-words", "0"]):
+                ["--max-sentences", "0"], ["--max-sentences", "x"], ["--max-words", "0"],
+                ["--enable", "semicolon"], ["--enable", "histry"]):
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 main(bad)
@@ -3680,21 +3702,33 @@ def selftest():
         ("phrasal-verb-technical", "Given back", "advisory"),
         ("phrasal-verb-technical", "back up", "advisory"),
         ("phrasal-verb-particle", "come back up", "advisory-free")], findings
+    # The history rule is opt-in, and hard when it is on.
+    text = "This no longer panics. It currently runs once. The flag was renamed."
+    assert not any(f["rule"] == "history" for f in lint(text)[0])
+    history = [(f["match"], f["level"]) for f in lint(text, enabled={"history"})[0]
+               if f["rule"] == "history"]
+    assert history == [("no longer", "advisory-free"), ("currently", "advisory-free"),
+                       ("was renamed", "advisory-free")], history
     print("selftest OK")
 
 
-RULE_IDS = {rule_id for rule_id, *_ in RULES} | {
+OPTIONAL_RULE_IDS = {rule_id for rule_id, *_ in OPTIONAL_RULES}
+RULE_IDS = {rule_id for rule_id, *_ in RULES} | OPTIONAL_RULE_IDS | {
     "long-sentence", "long-paragraph", "synonym-rotation", "dangling-conjunction"}
 
 
-def _rule_list(value):
+def _rule_list(value, known=RULE_IDS, kind="rule"):
     rules = {r for r in value.split(",") if r}
-    unknown = rules - RULE_IDS
+    unknown = rules - known
     if unknown:
         raise argparse.ArgumentTypeError(
-            f"unknown rule(s): {', '.join(sorted(unknown))}. "
-            f"Known rules: {', '.join(sorted(RULE_IDS))}")
+            f"unknown {kind}(s): {', '.join(sorted(unknown))}. "
+            f"Known {kind}s: {', '.join(sorted(known))}")
     return rules
+
+
+def _optional_rule_list(value):
+    return _rule_list(value, OPTIONAL_RULE_IDS, "opt-in rule")
 
 
 def _non_negative_int(value):
@@ -3726,6 +3760,9 @@ def main(argv):
     parser.add_argument("--disable", type=_rule_list, action="append", default=[],
                         metavar="RULES",
                         help="comma-separated rule IDs to silence; may be repeated")
+    parser.add_argument("--enable", type=_optional_rule_list, action="append", default=[],
+                        metavar="RULES",
+                        help="comma-separated opt-in rule IDs to run (history); may be repeated")
     parser.add_argument("--max-words", type=_positive_int, default=MAX_WORDS, metavar="N",
                         help=f"the words of one sentence, at most (default {MAX_WORDS})")
     parser.add_argument("--max-sentences", type=_positive_int, default=MAX_SENTENCES,
@@ -3742,6 +3779,7 @@ def main(argv):
         return 0
     as_json, baseline, paths = args.json, args.baseline, args.paths
     disabled = set().union(*args.disable)
+    enabled = set().union(*args.enable)
 
     findings, words_total, per_file = [], 0, []
     for p in paths or [None]:
@@ -3757,7 +3795,7 @@ def main(argv):
                 # A file that is not valid UTF-8 is unreadable.
                 parser.error(f"cannot read {p}: {e}")
         found, words = lint(text, filename=p, max_sentences=args.max_sentences,
-                            max_words=args.max_words)
+                            max_words=args.max_words, enabled=enabled)
         found = [f for f in found if f["rule"] not in disabled]
         hard = sum(1 for f in found if f["level"] == "advisory-free")
         per_file.append((p, hard, len(found) - hard, words))

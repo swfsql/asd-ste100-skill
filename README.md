@@ -39,6 +39,8 @@ For the sentence-length check, a word is a whitespace-separated token with at le
 
 `--summary` prints a header line, then one line per file: the hard count, the advisory count, the word count and the path. The file with the most hard violations comes first.
 
+`--enable history` adds an opt-in hard rule. It flags changelog phrasing ("no longer", "previously", "currently", "was renamed") in documentation of the current state. `--enable` accepts only opt-in rules, and an unknown rule name in `--enable` or `--disable` is an error (exit 2).
+
 The linter reads no prose in `$$` math blocks, inline `$` math and link reference definitions. It also skips the HTML blocks that GitHub hides or shows as code: comments, `<pre>`, `<?`, `<!X` and CDATA blocks.
 
 The repo's own prose does not lint clean: the rule tables quote the patterns they forbid, and some sentences and paragraphs run long. Lint it with `python scripts/ste-lint.py --baseline 35 SKILL.md` and read the findings as examples, not defects.
