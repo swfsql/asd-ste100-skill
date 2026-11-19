@@ -33,13 +33,32 @@ The structural rules it checks are mechanical — you can point at the word or p
 
 The linter checks structural patterns only. It does not compare an original text with a rewrite, verify that requirement strength stayed the same, or prove that the rewrite preserved meaning. A zero-violation result means that the configured structural checks found no problems.
 
-The deterministic linter checks semicolons, a short list of soft phrasal verbs (spin up, reach out, dive into, kick off, circle back, touch base, figure out, find out, point out, end up, come up with, get rid of, look into, sort out), phrasal verbs of a common verb and a particle (goes down, takes it down, comes back up), nominalizations, marketing adjectives, passive voice, present-perfect forms (including irregular participles such as "has run"), em dashes (advisory), technical phrasal verbs such as set up, back up and shut down (advisory), long sentences, long paragraphs (more than six sentences, or `--max-sentences N`), synonym rotation, and dangling conjunctions in supported list items. A table cell or a heading is no paragraph. Synonym rotation reads only verbs: after a determiner ("the start", "per launch"), in a hyphen compound, or as an adjective ("fixed shapes"), the word gives no finding. It does not check noun-cluster length (that needs part-of-speech tagging) and it does not know phrasal verbs outside its lists. A particle before a determiner can be a preposition ("go down the list"), so "take off the panel" passes. It never flags hedges or modality.
+The deterministic linter checks these patterns:
+
+- semicolons
+- a short list of soft phrasal verbs (spin up, reach out, dive into, kick off, circle back, touch base, figure out, find out, point out, end up, come up with, get rid of, look into, sort out)
+- phrasal verbs of a common verb and a particle (goes down, takes it down, comes back up)
+- nominalizations and marketing adjectives
+- long sentences, and long paragraphs (more than six sentences, or `--max-sentences N`)
+- synonym rotation, and dangling conjunctions in supported list items
+- advisory: passive voice, present-perfect forms (also "has run"), em dashes, and technical phrasal verbs (set up, back up, shut down)
+
+A table cell or a heading is no paragraph. Synonym rotation reads only verbs. A word after a determiner ("the start", "per launch"), in a hyphen compound, or as an adjective ("fixed shapes") gives no finding. It does not check noun-cluster length (that needs part-of-speech tagging) and it does not know phrasal verbs outside its lists. A particle before a determiner can be a preposition ("go down the list"), so "take off the panel" passes. It never flags hedges or modality.
 
 For the sentence-length check, a word is a whitespace-separated token with at least one letter or digit. Inline code in single backticks, list markers, blockquote markers, and bare punctuation such as a spaced em dash are not words. The cap is 25 words, and `--max-words N` sets it. A long-sentence or long-paragraph finding shows the start of its text (`excerpt` in the JSON output).
 
 `--summary` prints a header line, then one line per file: the hard count, the advisory count, the word count and the path. The file with the most hard violations comes first.
 
 `--enable history` adds an opt-in hard rule. It flags changelog phrasing ("no longer", "previously", "currently", "was renamed") in documentation of the current state. `--enable` accepts only opt-in rules, and an unknown rule name in `--enable` or `--disable` is an error (exit 2).
+
+For Rust source files (`*.rs`, or `--lang rust`), the linter reads only the prose, never the code. `--parts` selects the prose (default `docs,comments`):
+
+- `docs`: `///`, `//!`, `/** */` and `/*! */`.
+- `comments`: `//` and `/* */`, without the lines of commented-out code.
+- `messages`: string literals inside `panic!`, `assert!`, `expect`, `println!` and similar calls. Messages are error text, so they get the strict cap of 20 words (`--max-words-strict N`).
+- `strings`: every other string literal with three or more words.
+
+Each comment block and each string is a Markdown document of its own, and each finding points at its source line and column. Synonym rotation reads the whole file. In a message or a string, a format argument such as `{x:?}` counts as one word.
 
 The linter reads no prose in `$$` math blocks, inline `$` math and link reference definitions. It also skips the HTML blocks that GitHub hides or shows as code: comments, `<pre>`, `<?`, `<!X` and CDATA blocks.
 

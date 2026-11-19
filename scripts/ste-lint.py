@@ -12,6 +12,7 @@ Usage:
     ste-lint.py --disable passive-voice,present-perfect FILE
     ste-lint.py --summary FILE ...     # one line per file, the worst file first
     ste-lint.py --enable history FILE  # opt-in rules (see OPTIONAL_RULES)
+    ste-lint.py --parts docs,messages lib.rs  # the prose of a Rust file (see RUST_PARTS)
     ste-lint.py --selftest
 
 Exit 1 when hard ("advisory-free") violations exceed the baseline (default 0).
@@ -149,9 +150,11 @@ RULES = [
      # modal + perfect infinitive ("may have failed") is a protected hedge, not present perfect
      re.compile(r"(?<!\bmay )(?<!\bmight )(?<!\bcould )(?<!\bshould )(?<!\bwould )(?<!\bmust )\b(has|have|had)\s+(?:been\s+)?(?:\w+(?:ed|en)|" + IRREGULAR_PARTICIPLES + r")\b", re.I),
      "Compound tense. Use simple past/present unless current relevance is the point (then keep and flag)."),
-    # STE does not ban the em dash (Rule 8.1), but it often joins two ideas.
+    # STE does not ban the em dash (Rule 8.1), but it often joins two ideas. The dash
+    # needs text before it in its paragraph (see check in _lint_markdown). At the end
+    # of a line, the text after it is on the next line.
     ("em-dash", "advisory",
-     re.compile(r"(?<=\S)\s*—\s*(?=\S)"),
+     re.compile(r"—"),
      "Em dash joins two ideas (run-on). Consider two sentences, a colon, or parentheses."),
 ]
 
@@ -193,6 +196,22 @@ VERB_OBJECT = re.compile(r"\s+(?:the|a|an|it|this|that|these|those|them)\b", re.
 
 MAX_WORDS = 25  # descriptions cap; instructions cap is 20 but undetectable without context
 MAX_SENTENCES = 6  # the sentences of one paragraph (SKILL.md "Paragraph limits")
+MAX_WORDS_STRICT = 20  # error messages (Rust `messages`) are strict-mode text
+
+# Rust source: the parts of the prose (--parts), and the calls whose string
+# arguments are messages.
+RUST_PARTS = {"docs", "comments", "messages", "strings"}
+MESSAGE_CALLEES = {
+    "panic!", "assert!", "assert_eq!", "assert_ne!", "debug_assert!", "debug_assert_eq!",
+    "debug_assert_ne!", "unreachable!", "unimplemented!", "todo!", "expect", "expect_err",
+    "println!", "eprintln!", "print!", "eprint!", "format!", "write!", "writeln!",
+    "bail!", "anyhow!", "ensure!", "error!", "warn!", "info!",
+}
+RAW_STRING_START = re.compile(r'(?:b|c)?r(?P<hashes>#*)"')
+# A `//` line that ends like code and holds code punctuation: commented-out code.
+COMMENTED_OUT_CODE = re.compile(r"^(?=.*(?:[=(]|::|->)).*[;{}]\s*$")
+# A format argument in a message or a string: {}, {x}, {path:?}, {:>10.6}.
+FORMAT_ARG = re.compile(r"\{[^{}\s]*\}")
 
 CODE_FENCE = re.compile(r"^(`{3,}|~{3,})")
 INLINE_CODE = re.compile(r"`[^`]*`")
@@ -2040,11 +2059,304 @@ def _front_matter(text):
     return "\n" * (end + 1) + "\n".join(lines[end + 1:]), pieces
 
 
+def _unescape_rust_string(raw, raw_start, is_raw, pos):
+    """Split the body RAW of a string literal into (lineno, col0, text) lines.
+
+    RAW_START is the source index of RAW, and POS maps a source index to
+    (lineno, col0). A "\\n" escape and a real line end start a new line. A
+    backslash before a line end joins the lines, and the spaces at the start of
+    the next line go away, as rustc does. Another escape becomes one character,
+    so a column after an escape can be wrong by a few characters.
+    """
+    out, text, begin = [], [], None
+    k = 0
+
+    def end_line():
+        if begin is not None or text:
+            lineno, col = pos(raw_start + (begin if begin is not None else k))
+            out.append((lineno, col, "".join(text)))
+
+    while k < len(raw):
+        char = raw[k]
+        if begin is None:
+            begin = k
+        if not is_raw and char == "\\" and k + 1 < len(raw):
+            nxt = raw[k + 1]
+            if nxt == "\n":
+                k += 2
+                while k < len(raw) and raw[k] in " \t":
+                    k += 1
+                continue
+            if nxt == "n":
+                end_line()
+                text, begin = [], None
+                k += 2
+                continue
+            if nxt == "u":
+                close = raw.find("}", k)
+                text.append("?")
+                k = close + 1 if close > 0 else k + 2
+                continue
+            text.append(" " if nxt == "t" else nxt)
+            k += 2
+            continue
+        if char == "\n":
+            end_line()
+            text, begin = [], None
+            k += 1
+            continue
+        text.append(char)
+        k += 1
+    end_line()
+    return out
+
+
+def _rust_blocks(src, parts):
+    """Read the prose of Rust source SRC into blocks, and skip the code.
+
+    PARTS selects the prose (see RUST_PARTS). A block is {"kind", "lines"}, and
+    its lines are (lineno, col0, text): the text after the comment marker, with
+    the 0-based source column where it starts. Consecutive standalone comment
+    lines of one kind form one block. A `//` block also needs one indent. A
+    string literal is a block of its own. A string in a call of MESSAGE_CALLEES
+    is a message, and another string with three or more words is a string.
+    """
+    line_starts = [0] + [k + 1 for k, char in enumerate(src) if char == "\n"]
+
+    def pos(index):
+        line = bisect.bisect_right(line_starts, index) - 1
+        return line + 1, index - line_starts[line]
+
+    blocks, records = [], []
+    stack, prev = [], [None, None]  # the callee of each open bracket, the last two tokens
+    i, n = 0, len(src)
+
+    def is_ident_char(char):
+        return char.isalnum() or char == "_"
+
+    def add_string(content_start, raw, is_raw):
+        callee = stack[-1] if stack else None
+        kind = "messages" if callee in MESSAGE_CALLEES else "strings"
+        if ((kind == "messages" and "messages" in parts)
+                or ("strings" in parts and _count_words(raw) >= 3)):
+            blocks.append({"kind": kind,
+                           "lines": _unescape_rust_string(raw, content_start, is_raw, pos)})
+
+    while i < n:
+        char = src[i]
+        if src.startswith("//", i):
+            end = src.find("\n", i)
+            end = n if end < 0 else end
+            text = src[i:end]
+            lineno, col = pos(i)
+            standalone = not src[line_starts[lineno - 1]:i].strip()
+            if text.startswith("///") and not text.startswith("////"):
+                kind, prefix = "outer", 3
+            elif text.startswith("//!"):
+                kind, prefix = "inner", 3
+            else:
+                kind, prefix = "line", 2
+            content = text[prefix:]
+            if content.startswith(" "):
+                content, prefix = content[1:], prefix + 1
+            records.append((kind, lineno, col + prefix, content.rstrip(), standalone, col))
+            i = end
+            continue
+        if src.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if src.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif src.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            doc = (src.startswith("/*!", i)
+                   or (src.startswith("/**", i) and not src.startswith("/***", i)
+                       and not src.startswith("/**/", i)))
+            body_start = i + (3 if doc else 2)
+            lines, k = [], body_start
+            for piece in src[body_start:max(body_start, j - 2)].split("\n"):
+                lineno, col = pos(k)
+                stripped = piece.lstrip()
+                lead = len(piece) - len(stripped)
+                # A " * " at the start of a line of the comment is a margin, not text.
+                if stripped.startswith("*"):
+                    stripped = stripped[1:]
+                    lead += 1
+                    if stripped.startswith(" "):
+                        stripped, lead = stripped[1:], lead + 1
+                lines.append((lineno, col + lead, stripped.rstrip()))
+                k += len(piece) + 1
+            kind = "docs" if doc else "comments"
+            if kind in parts:
+                blocks.append({"kind": kind, "lines": lines})
+            i = j
+            continue
+        if char in "bcr" and (i == 0 or not is_ident_char(src[i - 1])):
+            raw = RAW_STRING_START.match(src, i)
+            if raw:
+                close = '"' + raw.group("hashes")
+                end = src.find(close, raw.end())
+                end = n if end < 0 else end
+                add_string(raw.end(), src[raw.end():end], True)
+                i = end + len(close)
+                continue
+            if char in "bc" and src.startswith('"', i + 1):
+                i += 1
+                char = '"'
+        if char == '"':
+            j = i + 1
+            while j < n and src[j] != '"':
+                j += 2 if src[j] == "\\" else 1
+            add_string(i + 1, src[i + 1:j], False)
+            i = j + 1
+            prev = [prev[1], ("string",)]
+            continue
+        if char == "'":
+            if src.startswith("\\", i + 1):
+                close = src.find("'", i + 3)
+                i = n if close < 0 else close + 1
+            elif i + 2 < n and src[i + 2] == "'":
+                i += 3
+            else:
+                i += 1  # a lifetime or a label
+            continue
+        if char.isalpha() or char == "_":
+            j = i
+            while j < n and is_ident_char(src[j]):
+                j += 1
+            prev = [prev[1], ("ident", src[i:j])]
+            i = j
+            continue
+        if char in "([{":
+            callee = None
+            if prev[1] and prev[1][0] == "ident":
+                callee = prev[1][1]
+            elif prev[1] == ("bang",) and prev[0] and prev[0][0] == "ident":
+                callee = prev[0][1] + "!"
+            stack.append(callee)
+            prev = [prev[1], ("open",)]
+        elif char in ")]}":
+            if stack:
+                stack.pop()
+            prev = [prev[1], ("close",)]
+        elif char == "!":
+            prev = [prev[1], ("bang",)]
+        elif not char.isspace():
+            prev = [prev[1], ("punct", char)]
+        i += 1
+
+    groups = []
+    for kind, lineno, col, content, standalone, indent in records:
+        last = groups[-1] if groups else None
+        if (last and standalone and last["standalone"] and last["kind"] == kind
+                and lineno == last["lines"][-1][0] + 1
+                and (kind != "line" or indent == last["indent"])):
+            last["lines"].append((lineno, col, content))
+        else:
+            groups.append({"kind": kind, "standalone": standalone, "indent": indent,
+                           "lines": [(lineno, col, content)]})
+    for group in groups:
+        kind = "comments" if group["kind"] == "line" else "docs"
+        if kind not in parts:
+            continue
+        lines = group["lines"]
+        if kind == "comments":
+            # A line of commented-out code becomes a blank line: it ends a paragraph.
+            lines = [(lineno, col, "" if COMMENTED_OUT_CODE.match(content) else content)
+                     for lineno, col, content in lines]
+        blocks.append({"kind": kind, "lines": lines})
+    blocks.sort(key=lambda block: block["lines"][0][:2] if block["lines"] else (0, 0))
+    return blocks
+
+
+def _lint_rust(text, filename, parts, max_sentences, max_words, max_words_strict, enabled,
+               seen_synonyms):
+    """Lint the prose of Rust source TEXT. Return (findings, words).
+
+    Each block of _rust_blocks is a Markdown document of its own, so a fence
+    that a block does not close ends with the block. The findings get the
+    source lines and columns. SEEN_SYNONYMS is shared by all blocks, so
+    synonym rotation reads the whole file. A message gets the strict word cap,
+    and a format argument in a message or a string counts as one word.
+    """
+    findings, words_total = [], 0
+    for block in _rust_blocks(text, parts):
+        lines = block["lines"]
+        contents = [content for _, _, content in lines]
+        if block["kind"] in ("messages", "strings"):
+            contents = [FORMAT_ARG.sub(lambda m: "X" + " " * (len(m.group(0)) - 1), content)
+                        for content in contents]
+        known = set(seen_synonyms)
+        found, words = _lint_markdown(
+            "\n".join(contents), filename, max_sentences,
+            max_words_strict if block["kind"] == "messages" else max_words,
+            enabled, seen_synonyms, front_matter=False)
+        for f in found:
+            lineno, col0, _ = lines[f["line"] - 1]
+            f["line"], f["col"] = lineno, col0 + f["col"]
+        for key in set(seen_synonyms) - known:
+            line, col, match = seen_synonyms[key]
+            lineno, col0, _ = lines[line - 1]
+            seen_synonyms[key] = (lineno, col0 + col, match)
+        findings.extend(found)
+        words_total += words
+    return findings, words_total
+
+
 def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES, max_words=MAX_WORDS,
-         enabled=()):
-    """Return (findings, words) for TEXT. ENABLED holds the IDs of the opt-in rules to run."""
+         enabled=(), lang=None, parts=None, max_words_strict=MAX_WORDS_STRICT):
+    """Return (findings, words) for TEXT.
+
+    ENABLED holds the IDs of the opt-in rules to run. LANG is "markdown" or
+    "rust". None reads a "*.rs" FILENAME as Rust. PARTS selects the prose of a
+    Rust file (default: docs and comments).
+    """
+    if lang is None:
+        lang = "rust" if filename.endswith(".rs") else "markdown"
+    seen_synonyms = {}
+    if lang == "rust":
+        findings, words_total = _lint_rust(
+            text, filename, set(parts or ("docs", "comments")), max_sentences, max_words,
+            max_words_strict, enabled, seen_synonyms)
+    else:
+        findings, words_total = _lint_markdown(text, filename, max_sentences, max_words,
+                                               enabled, seen_synonyms)
+    findings.extend(_synonym_findings(seen_synonyms, filename))
+    findings.sort(key=lambda f: (f["line"], f["col"]))
+    return findings, words_total
+
+
+def _synonym_findings(seen_synonyms, filename):
+    """Flag each member of a synonym group after the first, at its first occurrence.
+
+    SEEN_SYNONYMS maps (group index, base) to (line, col, match).
+    """
+    findings = []
+    for gi, group in enumerate(SYNONYM_GROUPS):
+        present = [(seen_synonyms[(gi, b)], b) for b in group if (gi, b) in seen_synonyms]
+        if len(present) > 1:
+            present.sort()  # document order
+            first_base = present[0][1]
+            for (lineno, col, match), base in present[1:]:
+                findings.append({"file": filename, "line": lineno, "col": col,
+                                 "rule": "synonym-rotation", "level": "advisory-free",
+                                 "match": match,
+                                 "message": f"'{base}' and '{first_base}' name the same action. Pick one and use it every time."})
+    return findings
+
+
+def _lint_markdown(text, filename, max_sentences, max_words, enabled, seen_synonyms,
+                   front_matter=True):
+    """Lint the Markdown TEXT. Return (findings, words) without synonym rotation.
+
+    ENABLED holds the IDs of the opt-in rules to run. The first occurrence of
+    each synonym-group member goes into SEEN_SYNONYMS (see _synonym_findings).
+    FRONT_MATTER: read a YAML front matter at the start of TEXT.
+    """
     rules = RULES + [rule for rule in OPTIONAL_RULES if rule[0] in enabled]
-    text, description = _front_matter(text)
+    text, description = _front_matter(text) if front_matter else (text, [])
     findings = []
     words_total = 0
     fence = None
@@ -2065,8 +2377,6 @@ def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES, max_words=MAX_WO
     html_containers = []
     lines = text.splitlines()
     table_cells = _markdown_table_cells(lines)
-    # first occurrence of each synonym-group member: (group_idx, base) -> (line, col, match)
-    seen_synonyms = {}
     # consecutive prose lines form one block, so wrapped sentences count once
     block = []
     blocks = []  # the blocks, read after the last line
@@ -2110,6 +2420,9 @@ def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES, max_words=MAX_WO
                 # the modal may end the line before: "may" / "have failed"
                 if (rule_id == "present-perfect"
                         and MODAL_PERFECT_PREFIX.search(lead + line[skip:m.start()])):
+                    continue
+                # The source line, not the masked line: a code span before the dash is text.
+                if rule_id == "em-dash" and not (lead or segment[skip:m.start()].strip()):
                     continue
                 if rule_id.startswith("phrasal-verb"):
                     index = bisect.bisect_left(earlier_starts, m.end()) - 1
@@ -2391,19 +2704,7 @@ def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES, max_words=MAX_WO
     flush()
     for prose, emphasis in zip(blocks, _block_emphasis(blocks)):
         findings.extend(_sentence_findings(prose, filename, emphasis, max_sentences, max_words))
-    # synonym rotation: flag each member after the first, at its first occurrence
-    for gi, group in enumerate(SYNONYM_GROUPS):
-        present = [(seen_synonyms[(gi, b)], b) for b in group if (gi, b) in seen_synonyms]
-        if len(present) > 1:
-            present.sort()  # document order
-            first_base = present[0][1]
-            for (lineno, col, match), base in present[1:]:
-                findings.append({"file": filename, "line": lineno, "col": col,
-                                 "rule": "synonym-rotation", "level": "advisory-free",
-                                 "match": match,
-                                 "message": f"'{base}' and '{first_base}' name the same action. Pick one and use it every time."})
     findings.extend(_dangling_conjunction_findings(text, filename))
-    findings.sort(key=lambda f: (f["line"], f["col"]))
     return findings, words_total
 
 
@@ -3692,6 +3993,11 @@ def selftest():
     # An em dash between two words is advisory. A dash alone in a table cell is no join.
     findings, _ = lint("One idea — and another.\n\n| a | b |\n| --- | --- |\n| — | x |")
     assert [(f["rule"], f["line"], f["level"]) for f in findings] == [("em-dash", 1, "advisory")], findings
+    # The dash joins the text before it: a code span, or the line before in the paragraph.
+    findings, _ = lint("- **K1** [`x`](y)\n  — per-chunk decays.\n\n`rank` — the size.\n\n— An attribution."
+                       "\n\nThe shape `[b, h]` — `γ`.\n\nThe paths —\nall three.")
+    assert [(f["line"], f["col"]) for f in findings if f["rule"] == "em-dash"] == [
+        (2, 3), (4, 8), (8, 20), (10, 11)], findings
     # A technical phrasal verb is advisory, also with a pronoun between its words. Where
     # another phrasal rule matches the same words, only that rule gives a finding.
     findings, _ = lint("Set it up. Turn it off. Given back. We back up the data. "
@@ -3709,6 +4015,63 @@ def selftest():
                if f["rule"] == "history"]
     assert history == [("no longer", "advisory-free"), ("currently", "advisory-free"),
                        ("was renamed", "advisory-free")], history
+    # Rust: code is never prose. Docs and comments are read as Markdown.
+    rust = (
+        "//! Module doc; with a semicolon.\n"
+        "use a::b; // trailing note; here\n"
+        "/// Outer doc that wraps\n"
+        "/// over two lines.\n"
+        "fn f<'a>(x: &'a str) -> char { let c = ';'; let s = \"not; prose\"; c }\n"
+        "// let commented = out(code);\n"
+        "/* block; comment */\n"
+        "fn g() { panic!(\"bad state; stop {x:?}\"); }\n"
+        "const R: &str = r#\"raw \"quoted\"; text here\"#;\n"
+    )
+    findings, _ = lint(rust, filename="lib.rs")
+    semicolons = sorted((f["line"], f["col"]) for f in findings if f["rule"] == "semicolon")
+    assert semicolons == [(1, 15), (2, 27), (7, 9)], semicolons
+    findings, _ = lint(rust, filename="lib.rs", parts={"messages"})
+    assert [(f["line"], f["col"]) for f in findings] == [(8, 27)], findings
+    findings, _ = lint(rust, filename="lib.rs", parts={"strings"})
+    assert sorted(f["line"] for f in findings) == [8, 9], findings
+    # A doc comment is one paragraph over its lines. Messages use the strict cap.
+    doc = "/// " + " ".join(["word"] * 13) + "\n/// " + " ".join(["word"] * 13) + ".\nfn f() {}\n"
+    findings, _ = lint(doc, filename="a.rs")
+    assert [(f["line"], f["col"], f["match"]) for f in findings] == [(1, 5, "26 words")], findings
+    msg = "fn f() { assert!(x, \"" + " ".join(["word"] * 21) + "\"); }\n"
+    assert [f["match"] for f in lint(msg, filename="a.rs", parts={"messages"})[0]] == ["21 words"]
+    assert not lint(msg, filename="a.rs", parts={"messages"}, max_words_strict=21)[0]
+    # a backslash continuation joins the string lines
+    cont = "fn f() { panic!(\"first half; \\\n    second half\"); }\n"
+    findings, _ = lint(cont, filename="a.rs", parts={"messages"})
+    assert [f["rule"] for f in findings] == ["semicolon"], findings
+    # The prose rules read doc comments: a long paragraph, a phrasal verb.
+    doc = "    /// " + seven + "\n    /// It goes down.\n    fn f() {}\n"
+    findings, _ = lint(doc, filename="a.rs")
+    assert [(f["rule"], f["line"], f["col"]) for f in findings] == [
+        ("long-paragraph", 1, 9), ("phrasal-verb-particle", 2, 12)], findings
+    # Synonym rotation reads the whole file. An open fence ends with its doc block.
+    doc = "/// Start the job.\n/// ```\nfn a() {}\n/// Launch the job; now.\nfn b() {}\n"
+    findings, _ = lint(doc, filename="a.rs")
+    assert [(f["rule"], f["line"]) for f in findings] == [
+        ("synonym-rotation", 4), ("semicolon", 4)], findings
+    # --lang rust reads stdin as Rust. --parts takes known parts only.
+    stdin, out = sys.stdin, io.StringIO()
+    try:
+        sys.stdin = io.StringIO("fn f() {} // a; b\n")
+        with contextlib.redirect_stdout(out):
+            assert main(["--lang", "rust"]) == 1
+    finally:
+        sys.stdin = stdin
+    assert "<stdin>:1:15 semicolon" in out.getvalue(), out.getvalue()
+    for bad in (["--parts", "docs,code"], ["--lang", "c"], ["--max-words-strict", "0"]):
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                main(bad)
+        except SystemExit as e:
+            assert e.code == 2, (bad, e.code)
+        else:
+            raise AssertionError(bad)
     print("selftest OK")
 
 
@@ -3729,6 +4092,10 @@ def _rule_list(value, known=RULE_IDS, kind="rule"):
 
 def _optional_rule_list(value):
     return _rule_list(value, OPTIONAL_RULE_IDS, "opt-in rule")
+
+
+def _part_list(value):
+    return _rule_list(value, RUST_PARTS, "part")
 
 
 def _non_negative_int(value):
@@ -3768,6 +4135,16 @@ def main(argv):
     parser.add_argument("--max-sentences", type=_positive_int, default=MAX_SENTENCES,
                         metavar="N",
                         help=f"the sentences of one paragraph, at most (default {MAX_SENTENCES})")
+    parser.add_argument("--lang", choices=("markdown", "rust"),
+                        help="read the input as Markdown or as Rust "
+                             "(default: Rust for a *.rs file, else Markdown)")
+    parser.add_argument("--parts", type=_part_list, metavar="PARTS",
+                        help="the prose of a Rust file: comma-separated docs, comments, "
+                             "messages, strings (default docs,comments)")
+    parser.add_argument("--max-words-strict", type=_positive_int, default=MAX_WORDS_STRICT,
+                        metavar="N",
+                        help=f"the words of one sentence in a Rust message, at most "
+                             f"(default {MAX_WORDS_STRICT})")
     parser.add_argument("--summary", action="store_true",
                         help="print one line per file (hard, advisory, words), "
                              "the most hard violations first")
@@ -3795,7 +4172,8 @@ def main(argv):
                 # A file that is not valid UTF-8 is unreadable.
                 parser.error(f"cannot read {p}: {e}")
         found, words = lint(text, filename=p, max_sentences=args.max_sentences,
-                            max_words=args.max_words, enabled=enabled)
+                            max_words=args.max_words, enabled=enabled, lang=args.lang,
+                            parts=args.parts, max_words_strict=args.max_words_strict)
         found = [f for f in found if f["rule"] not in disabled]
         hard = sum(1 for f in found if f["level"] == "advisory-free")
         per_file.append((p, hard, len(found) - hard, words))
