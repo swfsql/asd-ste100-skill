@@ -104,6 +104,11 @@ BRACKET = re.compile(r"[\[\]]")
 # A list item or a fence that can interrupt a paragraph: a bullet or "1." with text.
 PARAGRAPH_INTERRUPT = re.compile(r" {0,3}(?:[-+*][ \t]+\S|1[.)][ \t]+\S|`{3,}|~{3,})")
 AUTOLINK = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*>")
+# Inline math ($x^2$), as GitHub reads it: no space after the opening "$" or before
+# the closing "$", and no digit after the closing "$". So "$5 or $10" is no math.
+INLINE_MATH = re.compile(r"(?<![\\$\w])\$(?=[^\s$])[^$\n]*?(?<=[^\s\\])\$(?![\d$])")
+# A link reference definition ("[x]: url"). A footnote definition ("[^1]: text") is prose.
+LINK_DEFINITION = re.compile(r"\[(?!\^)[^\]]+\]:[ \t]*\S")
 EMAIL_AUTOLINK = re.compile(r"<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
                             r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*>")
 # A GFM extended autolink (www.example.com, https://example.com) ends before
@@ -637,7 +642,7 @@ def _link_destination_end(text, start, later_lines=(), depth=None):
 
 
 def _mask_non_prose(text, hidden=None):
-    """Fill character references and autolinks.
+    """Fill character references, autolinks and inline math.
 
     The fill is underscores, not spaces, so a token stays one token and word
     counts do not change. An underscore is not a word character for _count_words.
@@ -656,6 +661,10 @@ def _mask_non_prose(text, hidden=None):
             link = AUTOLINK.match(text, pos)
             if link:
                 end = link.end()
+        if end is None and text[pos] == "$":
+            math = INLINE_MATH.match(text, pos)
+            if math:
+                end = math.end()
         if end is None:
             pos += 1
             continue
@@ -1108,6 +1117,22 @@ def _fence_step(fence, line):
             and not content[marker.end():].strip(" \t")):
         return True, None
     return False, fence
+
+
+def _math_step(math, line):
+    """Return (in_math, math) for LINE, the text of a line after its quote prefix.
+
+    MATH is True when a "$$" math block is open before LINE. A line that starts
+    with "$$" opens a block, and the next line with "$$" ends it. A block can
+    open and end on one line ("$$x^2$$"). GitHub shows the block as math, not as
+    prose.
+    """
+    stripped = line.strip()
+    if math:
+        return True, "$$" not in stripped
+    if stripped.startswith("$$"):
+        return True, "$$" not in stripped[2:]
+    return False, False
 
 
 # CommonMark 4.6: how each kind of HTML block starts, and the text that ends it.
@@ -1861,8 +1886,10 @@ def lint(text, filename="<stdin>"):
     findings = []
     words_total = 0
     fence = None
+    math = False  # a "$$" math block is open
     html_block = None
     html_depth = 0
+    html_shows = True  # GitHub shows the text of the open HTML block as prose
     in_paragraph = False
     # content indent of the open list item, so its indented lines are not code
     list_indent = 0
@@ -1981,6 +2008,17 @@ def lint(text, filename="<stdin>"):
         if _fence_ends_with_quote(fence, raw_line):
             # The quote that holds the fence ended: judge this line as any other line.
             fence = None
+        if fence is None and html_block is None:
+            math_text = _strip_quotes(raw_line.expandtabs(4))[1]
+            # Four or more columns of indent make the line indented code, which opens
+            # no block.
+            if math or _indent_width(math_text) < list_indent + 4:
+                math_line, math = _math_step(math, math_text)
+                if math_line:
+                    flush()
+                    in_paragraph = False
+                    unquoted, after_boundary = math_text, False
+                    continue
         in_html = False
         if fence is None:
             # An HTML block can sit in a block quote. It ends when its quote ends. An
@@ -1997,6 +2035,7 @@ def lint(text, filename="<stdin>"):
             in_html, html_block = _html_block_step(html_block, line_unquoted, continues)
             if in_html and not was_html:
                 html_depth = line_depth
+                html_shows = _block_shows_text(html_block, line_unquoted)
         if in_html:
             # An HTML block holds literal text until it ends, so no fence opens in it.
             is_fence = False
@@ -2071,6 +2110,12 @@ def lint(text, filename="<stdin>"):
                         list_stack.clear()
                         unsure_list = lead > 0
         item_text = rest[ITEM_PREFIX.match(rest).end():]
+        # A link reference definition holds no prose. It cannot interrupt a paragraph.
+        if not in_html and new_paragraph and LINK_DEFINITION.match(item_text):
+            flush()
+            in_paragraph = False
+            after_boundary = False
+            continue
         if (list_indent and indent < list_indent + 4
                 and (depth > list_depth or item_text.startswith(">") or NO_PARAGRAPH.match(item_text)
                      or HTML_TYPE7.match(item_text) or any(start.match(item_text) for start, _ in HTML_BLOCK_KINDS))):
@@ -2111,6 +2156,10 @@ def lint(text, filename="<stdin>"):
             flush()
         in_quote = is_quote
         after_boundary = not raw_line.strip()
+        if in_html and not html_shows:
+            # GitHub hides the text of this HTML block, or shows it as code.
+            flush()
+            continue
         for segment, source_column in segments:
             if is_table:
                 paragraph += 1  # a table cell is a paragraph of its own
@@ -2535,12 +2584,13 @@ def selftest():
     # block that starts with a tag, and a quoted fence after it is a fence.
     for text, lines in (("<div>\n> ```\n> Prose; here.\n> ```\n</div>", [3]),
                         ("<custom>\n> ```\n> Prose; here.\n> ```\n</custom>", [3]),
-                        ("<!--\n> ```\n> Prose; here.\n> ```\n-->", [3]),
+                        # GitHub hides the text of these blocks, or shows it as code
+                        ("<!--\n```\n-->\n\nProse; here.", [5]),
                         ("<div>\n\n> ```\n> x; y\n> ```\n\nProse; here.", [7]),
                         ("<details>\n\n> ```\n> a; b\n> ```\n\n</details>\n\nProse; here.", [9]),
-                        ("<pre>\n> ```\n> Prose; here.\n> ```\n</pre>", [3]),
-                        ("<?php\n> ```\n> Prose; here.\n> ```\n?>", [3]),
-                        ("<![CDATA[\n> ```\n> Prose; here.\n> ```\n]]>", [3]),
+                        ("<pre>\n```\n</pre>\n\nProse; here.", [5]),
+                        ("<?php\n```\n?>\n\nProse; here.", [5]),
+                        ("<![CDATA[\n```\n]]>\n\nProse; here.", [5]),
                         # inline HTML is no HTML block: the quoted fence after it is a fence
                         ("<span>Label</span>\n> ```\n> a; b\n> ```", []),
                         ("<kbd>Enter</kbd> starts the job.\n> ```\n> a; b\n> ```", []),
@@ -3300,6 +3350,27 @@ def selftest():
     # a quote after a paragraph starts a block quote, so a type 7 tag in it starts a block
     findings, _ = lint("Paragraph.\n> <widget>\n> ```\n> Text; here.\n> ```")
     assert [(f["rule"], f["line"]) for f in findings] == [("semicolon", 4)], findings
+    # A "$$" math block holds no prose. Indented code opens no math block.
+    findings, _ = lint("$$\na; b\n$$\n\nProse; here.")
+    assert [(f["rule"], f["line"]) for f in findings] == [("semicolon", 5)], findings
+    findings, _ = lint("$$x; y$$\n\nProse; here.")
+    assert [(f["rule"], f["line"]) for f in findings] == [("semicolon", 3)], findings
+    findings, _ = lint("    $$\n\nProse; here.")
+    assert [(f["rule"], f["line"]) for f in findings] == [("semicolon", 3)], findings
+    # GitHub hides a comment and a "<?" block, and it shows a <pre> block as code.
+    findings, _ = lint("<!--\na; b\n-->\n\n<?php a; b ?>\n\n<pre>\na; b\n</pre>\n\nProse; here.")
+    assert [(f["rule"], f["line"]) for f in findings] == [("semicolon", 11)], findings
+    findings, _ = lint("<div>\nShown; here.\n</div>")
+    assert [(f["rule"], f["line"]) for f in findings] == [("semicolon", 2)], findings
+    # A link definition holds no prose. It cannot interrupt a paragraph, and a
+    # footnote definition is prose.
+    findings, _ = lint('[x]: http://a.b/c;d "t; u"\n- [y]: http://a.b/c;d\n\nProse; here.')
+    assert [(f["rule"], f["line"]) for f in findings] == [("semicolon", 4)], findings
+    findings, _ = lint("Text\n[x]: a;b\n\n[^1]: Note; here.")
+    assert [(f["rule"], f["line"]) for f in findings] == [("semicolon", 2), ("semicolon", 4)], findings
+    # Inline math holds no prose. A price is no math.
+    findings, _ = lint("Use $a;b$ here. It costs $5; or $10.")
+    assert [(f["rule"], f["col"]) for f in findings] == [("semicolon", 28)], findings
     print("selftest OK")
 
 
