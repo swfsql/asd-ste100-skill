@@ -1052,7 +1052,14 @@ def _sentence_starts(text, view=None, emphasis=None):
     return starts
 
 
-def _sentence_findings(pieces, filename, emphasis=None, max_sentences=MAX_SENTENCES):
+def _excerpt(text, size=80):
+    """Return the start of TEXT, at most SIZE characters, with its whitespace runs as one space."""
+    flat = " ".join(text.split())
+    return flat[:size] + ("…" if len(flat) > size else "")
+
+
+def _sentence_findings(pieces, filename, emphasis=None, max_sentences=MAX_SENTENCES,
+                       max_words=MAX_WORDS):
     """Flag long sentences, and a paragraph with too many sentences, in one prose block.
 
     pieces is a list of (lineno, source_column, text, view, ...) tuples. TEXT is the
@@ -1064,6 +1071,8 @@ def _sentence_findings(pieces, filename, emphasis=None, max_sentences=MAX_SENTEN
     A block is one paragraph, so the long-paragraph finding counts the
     sentences of the block that hold a word, and it points at the first word.
     A block of a table cell or a heading is no paragraph (piece[7] is True).
+    SOURCE (piece[8]) is the line before the masks, at the same length as TEXT.
+    Each finding has an excerpt of it.
     """
     offsets, position = [], 0
     for piece in pieces:
@@ -1071,26 +1080,28 @@ def _sentence_findings(pieces, filename, emphasis=None, max_sentences=MAX_SENTEN
         position += len(piece[2]) + 1
     joined = " ".join(piece[2] for piece in pieces)
     view = " ".join(piece[3] for piece in pieces)
+    source = " ".join(piece[8] for piece in pieces)
     findings = []
 
-    def add(start, rule_id, match, message):
+    def add(start, end, rule_id, match, message):
         index = bisect.bisect_right(offsets, start) - 1
         lineno, source_column = pieces[index][:2]
         findings.append({"file": filename, "line": lineno,
                          "col": source_column + start - offsets[index] + 1,
                          "rule": rule_id, "level": "advisory-free",
-                         "match": match, "message": message})
+                         "match": match, "message": message,
+                         "excerpt": _excerpt(source[start:end])})
 
     starts = _sentence_starts(joined, view, emphasis)
     sentences = 0
     for start, end in zip(starts, starts[1:] + [len(joined)]):
         n = _count_words(joined[start:end])
         sentences += n > 0
-        if n > MAX_WORDS:
-            add(start, "long-sentence", f"{n} words",
-                f"Sentence has {n} words (cap {MAX_WORDS}). Split it.")
+        if n > max_words:
+            add(start, end, "long-sentence", f"{n} words",
+                f"Sentence has {n} words (cap {max_words}). Split it.")
     if sentences > max_sentences and not pieces[0][7]:
-        add(starts[0], "long-paragraph", f"{sentences} sentences",
+        add(starts[0], len(joined), "long-paragraph", f"{sentences} sentences",
             f"Paragraph has {sentences} sentences (cap {max_sentences}). "
             "Split it: one topic in each paragraph.")
     return findings
@@ -1987,7 +1998,7 @@ def _front_matter(text):
     return "\n" * (end + 1) + "\n".join(lines[end + 1:]), pieces
 
 
-def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES):
+def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES, max_words=MAX_WORDS):
     text, description = _front_matter(text)
     findings = []
     words_total = 0
@@ -2075,7 +2086,7 @@ def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES):
         if add_to_block and line[skip:].strip():
             block.append((lineno, source_column + skip, line[skip:],
                           _emphasis_view(segment, line, hidden)[skip:], paragraph, wraps, unsure,
-                          no_paragraph))
+                          no_paragraph, segment[skip:]))
 
     # The description in the front matter is one paragraph of prose.
     span = 0
@@ -2327,7 +2338,7 @@ def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES):
             flush()
     flush()
     for prose, emphasis in zip(blocks, _block_emphasis(blocks)):
-        findings.extend(_sentence_findings(prose, filename, emphasis, max_sentences))
+        findings.extend(_sentence_findings(prose, filename, emphasis, max_sentences, max_words))
     # synonym rotation: flag each member after the first, at its first occurrence
     for gi, group in enumerate(SYNONYM_GROUPS):
         present = [(seen_synonyms[(gi, b)], b) for b in group if (gi, b) in seen_synonyms]
@@ -2352,7 +2363,8 @@ def report(findings, words_total, as_json, hard_count, baseline):
                           "words": words_total, "per_100_words": rate}, indent=2))
         return
     for f in findings:
-        print(f"{f['file']}:{f['line']}:{f['col']} {f['rule']}: {f['message']} [{f['match']}]")
+        detail = f"{f['match']}: {f['excerpt']}" if "excerpt" in f else f["match"]
+        print(f"{f['file']}:{f['line']}:{f['col']} {f['rule']}: {f['message']} [{detail}]")
     print(f"\n{len(findings)} violations ({hard_count} hard, baseline {baseline}), "
           f"{words_total} words, {rate} per 100 words")
     print("Hedges/modality (may, might, could) are never flagged: confidence is content.")
@@ -3436,6 +3448,14 @@ def selftest():
         with contextlib.redirect_stdout(io.StringIO()):
             assert main([paths[0]]) == 1
             assert main([paths[0], "--max-sentences", "7"]) == 0
+        # --max-words sets the cap of the long-sentence rule, and the excerpt follows the count
+        with open(paths[0], "w", encoding="utf-8") as fh:
+            fh.write(" ".join(["word"] * 30) + ".\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert main([paths[0]]) == 1
+            assert main([paths[0], "--max-words", "30"]) == 0
+        assert "[30 words: word word" in out.getvalue(), out.getvalue()
         # a file that is not valid UTF-8 is unreadable: exit 2, no traceback
         bad_path = os.path.join(tmp, "bad.md")
         with open(bad_path, "wb") as fh:
@@ -3453,7 +3473,7 @@ def selftest():
     # command-line parsing rejects typos and bad values
     for bad in (["--basline", "3"], ["--baseline"], ["--baseline", "x"],
                 ["--baseline", "-1"], ["--disable", "passive"], ["--base", "3"],
-                ["--max-sentences", "0"], ["--max-sentences", "x"]):
+                ["--max-sentences", "0"], ["--max-sentences", "x"], ["--max-words", "0"]):
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 main(bad)
@@ -3562,6 +3582,17 @@ def selftest():
     assert not any(f["rule"] == "synonym-rotation" for f in findings)
     findings, _ = lint("it goes down " * 20000)
     assert sum(f["rule"] == "phrasal-verb-particle" for f in findings) == 20000
+    # A long sentence and a long paragraph show an excerpt of the source text.
+    words = " ".join(f"w{n}" for n in range(30))
+    findings, _ = lint(f"Use `{words}` and {words}.")
+    excerpt = [f["excerpt"] for f in findings if f["rule"] == "long-sentence"]
+    assert excerpt == ["Use `" + words[:75] + "…"], findings
+    findings, _ = lint("One. Two.\nThree. Four. Five. Six. Seven.")
+    assert [f["excerpt"] for f in findings if f["rule"] == "long-paragraph"] == [
+        "One. Two. Three. Four. Five. Six. Seven."], findings
+    # max_words sets the cap of the long-sentence rule.
+    findings, _ = lint(words + ".", max_words=30)
+    assert not any(f["rule"] == "long-sentence" for f in findings), findings
     print("selftest OK")
 
 
@@ -3608,6 +3639,8 @@ def main(argv):
     parser.add_argument("--disable", type=_rule_list, action="append", default=[],
                         metavar="RULES",
                         help="comma-separated rule IDs to silence; may be repeated")
+    parser.add_argument("--max-words", type=_positive_int, default=MAX_WORDS, metavar="N",
+                        help=f"the words of one sentence, at most (default {MAX_WORDS})")
     parser.add_argument("--max-sentences", type=_positive_int, default=MAX_SENTENCES,
                         metavar="N",
                         help=f"the sentences of one paragraph, at most (default {MAX_SENTENCES})")
@@ -3631,11 +3664,13 @@ def main(argv):
             except UnicodeDecodeError as e:
                 # A file that is not valid UTF-8 is unreadable.
                 parser.error(f"cannot read {p}: {e}")
-            f, w = lint(text, filename=p, max_sentences=args.max_sentences)
+            f, w = lint(text, filename=p, max_sentences=args.max_sentences,
+                        max_words=args.max_words)
             findings.extend(f)
             words_total += w
     else:
-        findings, words_total = lint(sys.stdin.read(), max_sentences=args.max_sentences)
+        findings, words_total = lint(sys.stdin.read(), max_sentences=args.max_sentences,
+                                     max_words=args.max_words)
 
     findings = [f for f in findings if f["rule"] not in disabled]
     hard_count = sum(1 for f in findings if f["level"] == "advisory-free")
