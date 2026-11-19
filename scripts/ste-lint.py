@@ -141,6 +141,10 @@ UNICODE_SPACE = frozenset("\t\n\f\r \xa0           "
 LIST_ITEM_START = re.compile(
     r"^(?P<indent> {0,3})(?P<marker>[-*+]|[0-9]+[.)])(?P<gap> +)(?P<body>.*)$"
 )
+# A list marker at any indent, with the groups of LIST_ITEM_START (see _nested_item).
+DEEP_ITEM_START = re.compile(
+    r"^(?P<indent> *)(?P<marker>[-*+]|[0-9]+[.)])(?P<gap> +)(?P<body>.*)$"
+)
 CONJUNCTION_END = re.compile(r"\b(?:and|or)\s*$", re.I)
 TABLE_SEPARATOR_CELL = re.compile(r"^:?-+:?$")
 # Headings, thematic breaks, front-matter delimiters, and HTML lines stand alone.
@@ -1188,6 +1192,25 @@ def _tab_item(line):
     return LIST_ITEM_START.match(expanded) or LIST_ITEM_START.match(expanded + " ")
 
 
+def _nested_item(line, parents):
+    """Match LINE as a list item with four or more spaces of indent, or return None.
+
+    PARENTS are the content indents of the open list items, outermost first. The
+    marker starts an item in the deepest open item that its indent keeps open: at
+    the content indent of that item or after it, and less than four columns after
+    it (CommonMark 5.2). A deeper marker is indented code. Outside a list item,
+    the marker line is indented code or a lazy line.
+    """
+    item = DEEP_ITEM_START.match(line)
+    if not item or len(item.group("indent")) < 4:
+        return None
+    indent = len(item.group("indent"))
+    parent = next((column for column in reversed(parents) if column <= indent), None)
+    if parent is None or indent >= parent + 4:
+        return None
+    return item
+
+
 def _is_list_continuation(line, content_indent):
     if not line.strip():
         return True
@@ -1343,7 +1366,7 @@ def _dangling_conjunction_findings(text, filename):
             in_paragraph = False
             index += 1
             continue
-        start = LIST_ITEM_START.match(line)
+        start = LIST_ITEM_START.match(line) or _nested_item(line, open_items)
         if not start:
             # A blank line has only spaces and tabs: a no-break space is text. A line
             # with only quote markers is blank in its quote.
@@ -1432,7 +1455,7 @@ def _dangling_conjunction_findings(text, filename):
         # After five or more columns, or in an empty item, the content of the item starts
         # one column after the marker (CommonMark 5.2), so an HTML block there is in it.
         # A tab in the gap goes to the next tab stop. Indented code is no paragraph.
-        expanded = LIST_ITEM_START.match(line.expandtabs(4))
+        expanded = DEEP_ITEM_START.match(line.expandtabs(4))
         # After five or more columns the body is no item text: it is indented code, or
         # text of a paragraph outside list items. In an open HTML block, and in a
         # paragraph of a list item, it is item text.
@@ -1628,6 +1651,10 @@ def _dangling_conjunction_findings(text, filename):
             # an HTML block of the item is in the block, also after a list marker.
             if (item_fence is None and not _is_list_continuation(candidate, content_indent)
                     and not (in_html and item_html is None)):
+                break
+            # A nested item with four or more spaces of indent also ends the item, as a
+            # nested item with less indent does. The main loop reads it as an item.
+            if item_fence is None and not in_html and _nested_item(candidate, [content_indent]):
                 break
             # Fence delimiters are state markers, not meaningful item lines.
             # In an HTML block, a fence line is text.
@@ -2626,6 +2653,13 @@ def selftest():
     findings, _ = lint("- Parent item and\n  - Nested item or")
     dangling = [f for f in findings if f["rule"] == "dangling-conjunction"]
     assert [f["line"] for f in dangling] == [1, 2], dangling
+    # In an open item, a marker at four or more spaces starts a nested item.
+    findings, _ = lint("- Top item.\n  - Parent item.\n    - Child item and\n    - Next child.")
+    dangling = [f for f in findings if f["rule"] == "dangling-conjunction"]
+    assert [(f["line"], f["col"]) for f in dangling] == [(3, 5)], dangling
+    findings, _ = lint("- Top item and\n    - Nested item.")
+    dangling = [f for f in findings if f["rule"] == "dangling-conjunction"]
+    assert [f["line"] for f in dangling] == [1], dangling
 
     # ordinary prose, inline code, and fenced code are ignored
     findings, _ = lint("The process may include steps and")
