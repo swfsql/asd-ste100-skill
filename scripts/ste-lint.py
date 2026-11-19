@@ -137,6 +137,17 @@ SYNONYM_GROUPS = [
     ("get", "retrieve", "fetch", "obtain"),
     ("change", "modify", "alter"),
 ]
+# Synonym rotation is about verbs. A determiner before the word marks a noun
+# ("the start", "per launch"), and so does a hyphen compound ("kernel-launch",
+# "launch-bound"). "fixed" and "correct" are usually adjectives ("fixed shapes"),
+# unless an object follows ("fixed the bug").
+NOUN_BEFORE = re.compile(
+    r"(?:\b(?:the|a|an|this|that|these|those|each|every|its|their|per|at|of|one|no|any"
+    r"|same|both|few|fewer|many|more|most|some|all|other|such|first|last|two|three)\s+|-)$",
+    re.I)
+COMPOUND_AFTER = re.compile(r"-\w")
+ADJECTIVE_FORMS = {"fixed", "correct"}
+VERB_OBJECT = re.compile(r"\s+(?:the|a|an|it|this|that|these|those|them)\b", re.I)
 
 MAX_WORDS = 25  # descriptions cap; instructions cap is 20 but undetectable without context
 MAX_SENTENCES = 6  # the sentences of one paragraph (SKILL.md "Paragraph limits")
@@ -252,6 +263,34 @@ DOTTED_ABBREVIATION = re.compile(r"(?:[a-z]\.){2,}", re.I)
 
 def _word_re(base):
     return re.compile(r"\b" + base + r"(?:s|es|ed|d|ing)?\b", re.I)
+
+
+def _text_before(lead, text, start, size=32):
+    """Return the last SIZE characters before TEXT[START], with LEAD before TEXT.
+
+    A noun cue is one short word, so a cue check reads only this tail. A check
+    of the whole text before each match would make the cost quadratic.
+    """
+    before = text[max(0, start - size):start]
+    if start < size:
+        before = lead[len(lead) - (size - start):] + before
+    return before
+
+
+def _verb_match(pattern, text, lead=""):
+    """Return the first match of PATTERN in TEXT that reads as a verb, or None.
+
+    LEAD is the text before TEXT in its paragraph, so a determiner at the end of
+    the line before still marks a noun.
+    """
+    for m in pattern.finditer(text):
+        if (NOUN_BEFORE.search(_text_before(lead, text, m.start()))
+                or COMPOUND_AFTER.match(text, m.end())):
+            continue
+        if m.group(0).lower() in ADJECTIVE_FORMS and not VERB_OBJECT.match(text, m.end()):
+            continue
+        return m
+    return None
 
 
 def _count_words(text):
@@ -2002,18 +2041,19 @@ def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES):
         (a table cell or a heading), so the long-paragraph rule skips it."""
         nonlocal words_total
         words_total += len(line.split())
+        lead = block[-1][2] + " " if block else ""  # the line before, in this paragraph
         soft = []  # the (start, end) of each soft phrasal verb on the line
         for rule_id, level, pattern, msg in RULES:
             for m in pattern.finditer(line):
                 # the modal may end the line before: "may" / "have failed"
-                before = (block[-1][2] + " " if block else "") + line[skip:m.start()]
-                if rule_id == "present-perfect" and MODAL_PERFECT_PREFIX.search(before):
+                if (rule_id == "present-perfect"
+                        and MODAL_PERFECT_PREFIX.search(lead + line[skip:m.start()])):
                     continue
                 if rule_id == "phrasal-verb":
                     soft.append(m.span())
                 # One phrasal verb gives one finding: the soft list comes first in RULES.
                 if rule_id == "phrasal-verb-particle" and (
-                        NOUN_CUE.search(before)
+                        NOUN_CUE.search(_text_before(lead, line, m.start()))
                         or any(start < m.end() and m.start() < end for start, end in soft)):
                     continue
                 findings.append({"file": filename, "line": lineno,
@@ -2026,7 +2066,7 @@ def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES):
             for base in group:
                 if (gi, base) in seen_synonyms:
                     continue
-                m = _word_re(base).search(named)
+                m = _verb_match(_word_re(base), named, lead)
                 if m:
                     seen_synonyms[(gi, base)] = (
                         lineno, source_column + m.start() + 1, m.group(0)
@@ -3509,6 +3549,19 @@ def selftest():
         ("phrasal-verb", "figured out"), ("phrasal-verb", "Find out"), ("phrasal-verb", "Point out"),
         ("phrasal-verb", "ended up"), ("phrasal-verb", "Look into"), ("phrasal-verb", "Sort out"),
         ("phrasal-verb", "Get rid of"), ("phrasal-verb", "came up with")], findings
+    # Synonym rotation reads verbs: nouns and adjectives are no rotation.
+    findings, _ = lint("Start the job. Count each launch and the same launches. "
+                       "Both display forms. The kernel-launch count. Use fixed shapes. It is correct.")
+    assert not any(f["rule"] == "synonym-rotation" for f in findings), findings
+    findings, _ = lint("Start the job. Count each\nlaunch.")
+    assert not any(f["rule"] == "synonym-rotation" for f in findings), findings
+    findings, _ = lint("Fix the bug. Then corrected the value. Correct the typo.")
+    assert [f["match"] for f in findings if f["rule"] == "synonym-rotation"] == ["corrected"], findings
+    # a long line of nouns, or of phrasal verbs, stays linear
+    findings, _ = lint("Start it. " + "the launch " * 20000)
+    assert not any(f["rule"] == "synonym-rotation" for f in findings)
+    findings, _ = lint("it goes down " * 20000)
+    assert sum(f["rule"] == "phrasal-verb-particle" for f in findings) == 20000
     print("selftest OK")
 
 
