@@ -45,6 +45,55 @@ MODAL_PERFECT_PREFIX = re.compile(
     re.I,
 )
 
+# Phrasal verbs of a common verb and a particle (Rule 9.3): "goes down", "takes it
+# down", "comes back up". A closed list of verbs and particles keeps the rule
+# precise. Each verb has its forms. A pronoun can stand between the verb and the
+# particle, and a second particle can follow. The pairs that are also technical
+# terms (set up, turn off, give back) are not in the lists.
+PARTICLE_VERBS = [
+    ("go|goes|went|going|gone", ""),
+    ("come|comes|came|coming", ""),
+    ("get|gets|got|getting|gotten", ""),
+    ("take|takes|took|taking|taken", ""),
+    ("bring|brings|brought|bringing", ""),
+    ("put|puts|putting", ""),
+    ("set|sets|setting", "up"),
+    ("turn|turns|turned|turning", "off"),
+    ("give|gives|gave|giving|given", "back"),
+    ("keep|keeps|kept|keeping", ""),
+    ("break|breaks|broke|breaking|broken", ""),
+    ("hold|holds|held|holding", ""),
+    ("pull|pulls|pulled|pulling", ""),
+]
+PARTICLES = ("up", "down", "out", "off", "back", "over", "away")
+# Before a determiner, a particle can be a preposition: "go down the list". So is
+# "up to" ("takes up to five seconds"). "back" and "away" are never prepositions.
+# Limit: "takes down the server" gives no finding, because without part-of-speech
+# tagging it has the shape of "goes down the list".
+_DETERMINER = "the|a|an|its|their|each|every|this|that"
+# After one of these words the verb form is a noun: "leave the setting out". "this"
+# and "that" are not in the list, because they can be the subject: "this goes down".
+NOUN_CUE = re.compile(r"\b(?:the|a|an|its|their)\s+$", re.I)
+
+
+def _particle_re(particles):
+    alternatives = []
+    for particle in particles:
+        if particle in ("back", "away"):
+            alternatives.append(rf"{particle}\b")
+        else:
+            stop = _DETERMINER + ("|to" if particle == "up" else "")
+            alternatives.append(rf"{particle}\b(?!\s+(?:{stop})\b)")
+    return "(?:" + "|".join(alternatives) + ")"
+
+
+PHRASAL_VERB_PARTICLE = re.compile(
+    r"\b(?:" + "|".join(
+        rf"(?:{forms})\s+(?:(?:it|them|this|that|these|those)\s+)?"
+        + _particle_re(p for p in PARTICLES if p not in technical.split())
+        for forms, technical in PARTICLE_VERBS)
+    + r")(?:\s+" + _particle_re(PARTICLES) + ")?", re.I)
+
 RULES = [
     ("semicolon", "advisory-free",
      re.compile(r";"),
@@ -52,6 +101,9 @@ RULES = [
     ("phrasal-verb", "advisory-free",
      re.compile(r"\b(spin(?:ning|s)? up|spun up|reach(?:ing|es|ed)? out|div(?:e|es|ing|ed) into|dove into|kick(?:ing|s|ed)? off|circl(?:e|es|ing|ed) back|touch(?:ing|es|ed)? base)\b", re.I),
      "Soft phrasal verb. Use the single plain verb (start, contact, read, begin)."),
+    ("phrasal-verb-particle", "advisory-free",
+     PHRASAL_VERB_PARTICLE,
+     "Phrasal verb (Rule 9.3). Use one plain verb (move, return, leave, decrease)."),
     ("marketing-adjective", "advisory-free",
      re.compile(r"\b(seamless(?:ly)?|robust(?:ly)?|cutting-edge|effortless(?:ly)?|blazing[- ]fast|world-class|state-of-the-art|game-chang(?:ing|er))\b", re.I),
      "Marketing adjective. Delete, or replace with the measurement that earns the claim."),
@@ -1953,6 +2005,8 @@ def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES):
                 before = (block[-1][2] + " " if block else "") + line[skip:m.start()]
                 if rule_id == "present-perfect" and MODAL_PERFECT_PREFIX.search(before):
                     continue
+                if rule_id == "phrasal-verb-particle" and NOUN_CUE.search(before):
+                    continue
                 findings.append({"file": filename, "line": lineno,
                                  "col": source_column + m.start() + 1,
                                  "rule": rule_id, "level": level,
@@ -3420,6 +3474,25 @@ def selftest():
     # An abbreviation ends no sentence.
     findings, _ = lint("Use a tool, e.g. the linter. Two. Three. Four. Five. Six.")
     assert not any(f["rule"] == "long-paragraph" for f in findings), findings
+    # A common verb and a particle, with or without a pronoun between them.
+    findings, _ = lint("An untracked layer takes it down to the inner backend. The origin does "
+                       "not come back up. The cache goes down with the layer.")
+    particle = [(f["match"], f["level"]) for f in findings if f["rule"] == "phrasal-verb-particle"]
+    assert particle == [("takes it down", "advisory-free"), ("come back up", "advisory-free"),
+                        ("goes down", "advisory-free")], findings
+    findings, _ = lint("Put back the caches. Kept them away. It turns out fine.")
+    assert [f["match"] for f in findings if f["rule"] == "phrasal-verb-particle"] == [
+        "Put back", "Kept them away", "turns out"], findings
+    # Before a determiner, the particle can be a preposition. "Up to" is one too.
+    # The technical pairs (set up, turn off, give back) belong to another rule.
+    for text in ("Go down the list.", "It goes over each item.", "It takes up to five seconds.",
+                 "Set it up. Turn it off. Give it back. The setup goes upward.",
+                 "Do not leave the setting out.", "A break up is no verb."):
+        findings, _ = lint(text)
+        assert not any(f["rule"] == "phrasal-verb-particle" for f in findings), (text, findings)
+    # "this" and "that" can be the subject.
+    findings, _ = lint("This goes down.")
+    assert [f["match"] for f in findings if f["rule"] == "phrasal-verb-particle"] == ["goes down"], findings
     print("selftest OK")
 
 
