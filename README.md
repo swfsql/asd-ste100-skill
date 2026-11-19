@@ -37,6 +37,8 @@ The deterministic linter checks semicolons, a short list of soft phrasal verbs (
 
 For the sentence-length check, a word is a whitespace-separated token with at least one letter or digit. Inline code in single backticks, list markers, blockquote markers, and bare punctuation such as a spaced em dash are not words. The cap is 25 words, and `--max-words N` sets it. A long-sentence or long-paragraph finding shows the start of its text (`excerpt` in the JSON output).
 
+`--summary` prints a header line, then one line per file: the hard count, the advisory count, the word count and the path. The file with the most hard violations comes first.
+
 The linter reads no prose in `$$` math blocks, inline `$` math and link reference definitions. It also skips the HTML blocks that GitHub hides or shows as code: comments, `<pre>`, `<?`, `<!X` and CDATA blocks.
 
 The repo's own prose does not lint clean: the rule tables quote the patterns they forbid, and some sentences and paragraphs run long. Lint it with `python scripts/ste-lint.py --baseline 37 SKILL.md` and read the findings as examples, not defects.

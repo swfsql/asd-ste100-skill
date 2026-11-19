@@ -10,6 +10,7 @@ Usage:
     echo "text" | ste-lint.py [--json]
     ste-lint.py --baseline 5 FILE      # pass unless hard violations exceed 5
     ste-lint.py --disable passive-voice,present-perfect FILE
+    ste-lint.py --summary FILE ...     # one line per file, the worst file first
     ste-lint.py --selftest
 
 Exit 1 when hard ("advisory-free") violations exceed the baseline (default 0).
@@ -24,6 +25,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unicodedata
@@ -2370,6 +2372,18 @@ def report(findings, words_total, as_json, hard_count, baseline):
     print("Hedges/modality (may, might, could) are never flagged: confidence is content.")
 
 
+def report_summary(per_file):
+    """Print a header line, then one line per file, the most hard violations first.
+
+    PER_FILE holds a (path, hard, advisory, words) row for each file. The first
+    field of each row line is the hard count, so a script can read it.
+    """
+    rows = sorted(per_file, key=lambda row: (-row[1], -row[2], row[0]))
+    print(f"{'hard':>5} {'adv':>5} {'words':>7}  file")
+    for path, hard, advisory, words in rows:
+        print(f"{hard:>5} {advisory:>5} {words:>7}  {path}")
+
+
 def selftest():
     bad = ("The panel is removed; spin up the job. "
            "Perform an analysis of the seamless log. "
@@ -3456,6 +3470,29 @@ def selftest():
             assert main([paths[0]]) == 1
             assert main([paths[0], "--max-words", "30"]) == 0
         assert "[30 words: word word" in out.getvalue(), out.getvalue()
+        # --summary prints one line per file, the most hard violations first
+        with open(paths[1], "w", encoding="utf-8") as fh:
+            fh.write("a; b; c. We have received it.\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert main(["--summary", paths[0], paths[1]]) == 1
+            assert main(["--summary", "--baseline", "9", "--disable", "semicolon", paths[1]]) == 0
+        lines = out.getvalue().splitlines()
+        assert lines[0].split() == ["hard", "adv", "words", "file"], lines
+        assert [line.split() for line in lines[1:3]] == [
+            ["2", "1", "7", paths[1]], ["1", "0", "30", paths[0]]], lines
+        assert lines[4].split() == ["0", "1", "7", paths[1]], lines
+        # a closed pipe ends the run without a traceback
+        with open(paths[0], "w", encoding="utf-8") as fh:
+            fh.write("a; b.\n" * 3000)
+        proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), paths[0]],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc.stdout.readline()
+        proc.stdout.close()
+        err = proc.stderr.read()
+        proc.wait()
+        proc.stderr.close()
+        assert b"Traceback" not in err and b"BrokenPipe" not in err, err
         # a file that is not valid UTF-8 is unreadable: exit 2, no traceback
         bad_path = os.path.join(tmp, "bad.md")
         with open(bad_path, "wb") as fh:
@@ -3644,6 +3681,9 @@ def main(argv):
     parser.add_argument("--max-sentences", type=_positive_int, default=MAX_SENTENCES,
                         metavar="N",
                         help=f"the sentences of one paragraph, at most (default {MAX_SENTENCES})")
+    parser.add_argument("--summary", action="store_true",
+                        help="print one line per file (hard, advisory, words), "
+                             "the most hard violations first")
     parser.add_argument("--selftest", action="store_true", help="run the built-in tests")
     # intermixed parsing keeps flags valid between file paths
     args = parser.parse_intermixed_args(argv)
@@ -3653,9 +3693,11 @@ def main(argv):
     as_json, baseline, paths = args.json, args.baseline, args.paths
     disabled = set().union(*args.disable)
 
-    findings, words_total = [], 0
-    if paths:
-        for p in paths:
+    findings, words_total, per_file = [], 0, []
+    for p in paths or [None]:
+        if p is None:
+            p, text = "<stdin>", sys.stdin.read()
+        else:
             try:
                 with open(p, encoding="utf-8") as fh:
                     text = fh.read()
@@ -3664,19 +3706,27 @@ def main(argv):
             except UnicodeDecodeError as e:
                 # A file that is not valid UTF-8 is unreadable.
                 parser.error(f"cannot read {p}: {e}")
-            f, w = lint(text, filename=p, max_sentences=args.max_sentences,
-                        max_words=args.max_words)
-            findings.extend(f)
-            words_total += w
-    else:
-        findings, words_total = lint(sys.stdin.read(), max_sentences=args.max_sentences,
-                                     max_words=args.max_words)
+        found, words = lint(text, filename=p, max_sentences=args.max_sentences,
+                            max_words=args.max_words)
+        found = [f for f in found if f["rule"] not in disabled]
+        hard = sum(1 for f in found if f["level"] == "advisory-free")
+        per_file.append((p, hard, len(found) - hard, words))
+        findings.extend(found)
+        words_total += words
 
-    findings = [f for f in findings if f["rule"] not in disabled]
-    hard_count = sum(1 for f in findings if f["level"] == "advisory-free")
-    report(findings, words_total, as_json, hard_count, baseline)
+    hard_count = sum(row[1] for row in per_file)
+    if args.summary:
+        report_summary(per_file)
+    else:
+        report(findings, words_total, as_json, hard_count, baseline)
     return 1 if hard_count > baseline else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        # The reader closed the pipe (`ste-lint.py FILE | head`). Send the rest of the
+        # output to devnull, so the flush at exit raises no second error.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
