@@ -99,7 +99,10 @@ RULES = [
      re.compile(r";"),
      "STE bans the semicolon (Rule 8.1). Split into separate sentences."),
     ("phrasal-verb", "advisory-free",
-     re.compile(r"\b(spin(?:ning|s)? up|spun up|reach(?:ing|es|ed)? out|div(?:e|es|ing|ed) into|dove into|kick(?:ing|s|ed)? off|circl(?:e|es|ing|ed) back|touch(?:ing|es|ed)? base)\b", re.I),
+     re.compile(r"\b(spin(?:ning|s)? up|spun up|reach(?:ing|es|ed)? out|div(?:e|es|ing|ed) into|dove into|kick(?:ing|s|ed)? off|circl(?:e|es|ing|ed) back|touch(?:ing|es|ed)? base"
+                r"|figur(?:e|es|ed|ing) out|find(?:s|ing)? out|found out|point(?:s|ed|ing)? out|end(?:s|ed|ing)? up"
+                r"|(?:come|comes|came|coming) up with|(?:get|gets|got|getting|gotten) rid of"
+                r"|look(?:s|ed|ing)? into|sort(?:s|ed|ing)? out)\b", re.I),
      "Soft phrasal verb. Use the single plain verb (start, contact, read, begin)."),
     ("phrasal-verb-particle", "advisory-free",
      PHRASAL_VERB_PARTICLE,
@@ -1999,13 +2002,19 @@ def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES):
         (a table cell or a heading), so the long-paragraph rule skips it."""
         nonlocal words_total
         words_total += len(line.split())
+        soft = []  # the (start, end) of each soft phrasal verb on the line
         for rule_id, level, pattern, msg in RULES:
             for m in pattern.finditer(line):
                 # the modal may end the line before: "may" / "have failed"
                 before = (block[-1][2] + " " if block else "") + line[skip:m.start()]
                 if rule_id == "present-perfect" and MODAL_PERFECT_PREFIX.search(before):
                     continue
-                if rule_id == "phrasal-verb-particle" and NOUN_CUE.search(before):
+                if rule_id == "phrasal-verb":
+                    soft.append(m.span())
+                # One phrasal verb gives one finding: the soft list comes first in RULES.
+                if rule_id == "phrasal-verb-particle" and (
+                        NOUN_CUE.search(before)
+                        or any(start < m.end() and m.start() < end for start, end in soft)):
                     continue
                 findings.append({"file": filename, "line": lineno,
                                  "col": source_column + m.start() + 1,
@@ -3493,6 +3502,13 @@ def selftest():
     # "this" and "that" can be the subject.
     findings, _ = lint("This goes down.")
     assert [f["match"] for f in findings if f["rule"] == "phrasal-verb-particle"] == ["goes down"], findings
+    # More soft phrasal verbs. The soft list wins where the two lists match the same words.
+    findings, _ = lint("We figured out the cause. Find out more. Point out the bug. It ended up "
+                       "empty. Look into it. Sort out the data. Get rid of it. She came up with a plan.")
+    assert [(f["rule"], f["match"]) for f in findings if f["rule"].startswith("phrasal")] == [
+        ("phrasal-verb", "figured out"), ("phrasal-verb", "Find out"), ("phrasal-verb", "Point out"),
+        ("phrasal-verb", "ended up"), ("phrasal-verb", "Look into"), ("phrasal-verb", "Sort out"),
+        ("phrasal-verb", "Get rid of"), ("phrasal-verb", "came up with")], findings
     print("selftest OK")
 
 
