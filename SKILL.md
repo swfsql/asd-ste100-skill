@@ -91,14 +91,14 @@ These six habits cover most of what makes machine-written English hard to parse.
 2. Read the input text once for meaning — do not start rewriting before you understand what it must still say afterward.
 3. Walk it sentence by sentence. Flag every rule violation from the Core Rewrite Rules tables and every habit from the Scan Checklist. In STE-flavored mode, flag the lexical rules but do not enforce them. That choice is for the rewrite. The linter has no flavored mode, and synonym rotation stays a hard finding. Pass `--disable synonym-rotation` to drop it.
 
-   For a mechanical first pass over the structural rules, run `scripts/ste-lint.py` (stdin or file args, `--json` for structured output). It checks semicolons, sentence length, paragraph length, phrasal verbs, nominalization, marketing adjectives, synonym rotation and dangling conjunctions in supported list items. As advisory findings, it also flags passive voice, compound tenses, em dashes and technical phrasal verbs (set up, back up, shut down). By design, it never flags hedges or modality. Its options:
+   For a mechanical first pass over the structural rules, run `scripts/ste-lint.py` (stdin or file args, `--json` for structured output). It checks semicolons, sentence length, paragraph length, phrasal verbs, nominalization, marketing adjectives, synonym rotation and dangling conjunctions in supported list items. The phrasal-verb rules also read a common verb and a particle, with or without a pronoun between them. As advisory findings, it also flags passive voice, compound tenses, em dashes and technical phrasal verbs (set up, back up, shut down). By design, it never flags hedges or modality. Its options:
 
    - `--baseline N` tolerates N hard violations (for adopting on existing docs).
    - `--disable rule1,rule2` silences named rules.
    - `--max-words N` sets the sentence cap (default 25), and `--max-sentences N` sets the paragraph cap (default 6).
    - `--summary` ranks many files by violations.
    - `--enable history` adds an opt-in hard rule that flags changelog phrasing ("no longer", "previously", "currently").
-   - In a `.rs` file the linter reads only the prose: doc comments and comments. With `--parts messages` it also reads the strings of `panic!`/`expect`/`assert!` calls, at the strict word cap.
+   - In a `.rs` file the linter reads only the prose: doc comments and comments. With `--parts docs,comments,messages` it also reads the strings of `panic!`/`expect`/`assert!` calls, at the strict word cap.
 4. Rewrite each flagged sentence to fix the violation while preserving the original meaning exactly. If a rewrite would drop necessary precision (a safety condition, a scope qualifier, a number), keep the longer phrasing and flag it instead of silently simplifying.
    - **Check modality before you commit to a rewrite.** Hedges ("may", "could", "sometimes", "is likely to") carry the author's confidence, and confidence is content. A shorter sentence that upgrades a hedge to a fact is not a simplification — it is a different claim. This is the most common way a well-intentioned STE rewrite goes wrong, because hedges are exactly what a length cap tempts you to cut.
    - Never add a fact the source did not state. A rewrite that reads better because it supplies a cause, a frequency, or a mechanism has stopped being a rewrite.

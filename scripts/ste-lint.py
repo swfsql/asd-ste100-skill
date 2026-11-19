@@ -12,7 +12,9 @@ Usage:
     ste-lint.py --disable passive-voice,present-perfect FILE
     ste-lint.py --summary FILE ...     # one line per file, the worst file first
     ste-lint.py --enable history FILE  # opt-in rules (see OPTIONAL_RULES)
+    ste-lint.py --max-words 20 --max-sentences 4 FILE  # the sentence and paragraph caps
     ste-lint.py --parts docs,messages lib.rs  # the prose of a Rust file (see RUST_PARTS)
+    cat lib.rs | ste-lint.py --lang rust      # stdin as Rust
     ste-lint.py --selftest
 
 Exit 1 when hard ("advisory-free") violations exceed the baseline (default 0).
@@ -50,25 +52,50 @@ MODAL_PERFECT_PREFIX = re.compile(
     re.I,
 )
 
+# The pronouns that can stand between a verb and its particle: "sets it up".
+_PRONOUN = "it|them|this|that|these|those"
+
+# Phrasal verbs that are also technical terms: "set up", "back up", "shut down".
+# They can be correct, so the rule is advisory. A pronoun can stand between the
+# verb and the particle ("sets it up").
+TECHNICAL_PAIRS = [
+    ("set|sets|setting", "up"),
+    ("fall|falls|falling|fell|fallen", "back"),
+    ("back|backs|backed|backing", "up"),
+    ("turn|turns|turned|turning", "on|off"),
+    ("shut|shuts|shutting", "down"),
+    ("pick|picks|picked|picking", "up"),
+    ("hand|hands|handed|handing", "off|over|on|back"),
+    ("rule|rules|ruled|ruling", "out"),
+    ("fill|fills|filled|filling", "in"),
+    ("carry|carries|carried|carrying", "on"),
+    ("give|gives|gave|giving|given", "back"),
+]
+PHRASAL_VERB_TECHNICAL = re.compile(
+    r"\b(?:" + "|".join(
+        rf"(?:{forms})(?:\s+(?:{_PRONOUN}))?\s+(?:{particles})"
+        for forms, particles in TECHNICAL_PAIRS)
+    + r")\b", re.I)
+
 # Phrasal verbs of a common verb and a particle (Rule 9.3): "goes down", "takes it
 # down", "comes back up". A closed list of verbs and particles keeps the rule
-# precise. Each verb has its forms. A pronoun can stand between the verb and the
-# particle, and a second particle can follow. The pairs that are also technical
-# terms (set up, turn off, give back) are not in the lists.
+# precise. Each entry holds the forms of one verb. A pronoun can stand between the
+# verb and the particle, and a second particle can follow. The pairs of
+# TECHNICAL_PAIRS (set up, turn off, give back) are not in this rule.
 PARTICLE_VERBS = [
-    ("go|goes|went|going|gone", ""),
-    ("come|comes|came|coming", ""),
-    ("get|gets|got|getting|gotten", ""),
-    ("take|takes|took|taking|taken", ""),
-    ("bring|brings|brought|bringing", ""),
-    ("put|puts|putting", ""),
-    ("set|sets|setting", "up"),
-    ("turn|turns|turned|turning", "off"),
-    ("give|gives|gave|giving|given", "back"),
-    ("keep|keeps|kept|keeping", ""),
-    ("break|breaks|broke|breaking|broken", ""),
-    ("hold|holds|held|holding", ""),
-    ("pull|pulls|pulled|pulling", ""),
+    "go|goes|went|going|gone",
+    "come|comes|came|coming",
+    "get|gets|got|getting|gotten",
+    "take|takes|took|taking|taken",
+    "bring|brings|brought|bringing",
+    "put|puts|putting",
+    "set|sets|setting",
+    "turn|turns|turned|turning",
+    "give|gives|gave|giving|given",
+    "keep|keeps|kept|keeping",
+    "break|breaks|broke|breaking|broken",
+    "hold|holds|held|holding",
+    "pull|pulls|pulled|pulling",
 ]
 PARTICLES = ("up", "down", "out", "off", "back", "over", "away")
 # Before a determiner, a particle can be a preposition: "go down the list". So is
@@ -92,33 +119,18 @@ def _particle_re(particles):
     return "(?:" + "|".join(alternatives) + ")"
 
 
-# Phrasal verbs that are also technical terms: "set up", "back up", "shut down".
-# They can be correct, so the rule is advisory. A pronoun can stand between the
-# verb and the particle ("sets it up").
-TECHNICAL_PAIRS = [
-    ("set|sets|setting", "up"),
-    ("fall|falls|falling|fell|fallen", "back"),
-    ("back|backs|backed|backing", "up"),
-    ("turn|turns|turned|turning", "on|off"),
-    ("shut|shuts|shutting", "down"),
-    ("pick|picks|picked|picking", "up"),
-    ("hand|hands|handed|handing", "off|over|on|back"),
-    ("rule|rules|ruled|ruling", "out"),
-    ("fill|fills|filled|filling", "in"),
-    ("carry|carries|carried|carrying", "on"),
-    ("give|gives|gave|giving|given", "back"),
-]
-PHRASAL_VERB_TECHNICAL = re.compile(
-    r"\b(?:" + "|".join(
-        rf"(?:{forms})(?:\s+(?:it|them|this|that|these|those))?\s+(?:{particles})"
-        for forms, particles in TECHNICAL_PAIRS)
-    + r")\b", re.I)
+def _technical_particles(forms):
+    """Return the particles that make a technical pair with a verb of the FORMS."""
+    verb = set(forms.split("|"))
+    return {particle for technical, particles in TECHNICAL_PAIRS
+            if verb & set(technical.split("|")) for particle in particles.split("|")}
+
 
 PHRASAL_VERB_PARTICLE = re.compile(
     r"\b(?:" + "|".join(
-        rf"(?:{forms})\s+(?:(?:it|them|this|that|these|those)\s+)?"
-        + _particle_re(p for p in PARTICLES if p not in technical.split())
-        for forms, technical in PARTICLE_VERBS)
+        rf"(?:{forms})\s+(?:(?:{_PRONOUN})\s+)?"
+        + _particle_re(p for p in PARTICLES if p not in _technical_particles(forms))
+        for forms in PARTICLE_VERBS)
     + r")(?:\s+" + _particle_re(PARTICLES) + ")?", re.I)
 
 RULES = [
@@ -187,9 +199,12 @@ SYNONYM_GROUPS = [
 # "launch-bound"). "fixed" and "correct" are usually adjectives ("fixed shapes"),
 # unless an object follows ("fixed the bug").
 NOUN_BEFORE = re.compile(
-    r"(?:\b(?:the|a|an|this|that|these|those|each|every|its|their|per|at|of|one|no|any"
+    r"(?:\b(?:the|a|an|these|those|each|every|its|their|per|at|of|one|no|any"
     r"|same|both|few|fewer|many|more|most|some|all|other|such|first|last|two|three)\s+|-)$",
     re.I)
+# "this" and "that" can also be a subject or a relative pronoun: "This retrieves
+# the key", "the step that retrieves it". After them, only the bare word is a noun.
+DEMONSTRATIVE_BEFORE = re.compile(r"\b(?:this|that)\s+$", re.I)
 COMPOUND_AFTER = re.compile(r"-\w")
 ADJECTIVE_FORMS = {"fixed", "correct"}
 VERB_OBJECT = re.compile(r"\s+(?:the|a|an|it|this|that|these|those|them)\b", re.I)
@@ -235,8 +250,12 @@ AUTOLINK = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*>")
 # Inline math ($x^2$), as GitHub reads it: no space after the opening "$" or before
 # the closing "$", and no digit after the closing "$". So "$5 or $10" is no math.
 INLINE_MATH = re.compile(r"(?<![\\$\w])\$(?=[^\s$])[^$\n]*?(?<=[^\s\\])\$(?![\d$])")
-# A link reference definition ("[x]: url"). A footnote definition ("[^1]: text") is prose.
-LINK_DEFINITION = re.compile(r"\[(?!\^)[^\]]+\]:[ \t]*\S")
+# A link reference definition: "[x]: url", then an optional title in quotes or
+# parentheses, then the end of the line (CommonMark 4.7). A footnote definition
+# ("[^1]: text") is prose. Limit: a title on the next line is read as prose.
+LINK_DEFINITION = re.compile(
+    r"\[(?!\^)[^\]]+\]:[ \t]*(?:<[^<>\n]*>|[^\s<]\S*)"
+    r"(?:[ \t]+(?:\"[^\"]*\"|'[^']*'|\([^()]*\)))?[ \t]*$")
 EMAIL_AUTOLINK = re.compile(r"<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
                             r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*>")
 # A GFM extended autolink (www.example.com, https://example.com) ends before
@@ -338,15 +357,16 @@ def _text_before(lead, text, start, size=32):
     return before
 
 
-def _verb_match(pattern, text, lead=""):
-    """Return the first match of PATTERN in TEXT that reads as a verb, or None.
+def _verb_match(base, text, lead=""):
+    """Return the first form of the verb BASE in TEXT that reads as a verb, or None.
 
     LEAD is the text before TEXT in its paragraph, so a determiner at the end of
     the line before still marks a noun.
     """
-    for m in pattern.finditer(text):
-        if (NOUN_BEFORE.search(_text_before(lead, text, m.start()))
-                or COMPOUND_AFTER.match(text, m.end())):
+    for m in _word_re(base).finditer(text):
+        before = _text_before(lead, text, m.start())
+        if (NOUN_BEFORE.search(before) or COMPOUND_AFTER.match(text, m.end())
+                or (DEMONSTRATIVE_BEFORE.search(before) and m.group(0).lower() == base)):
             continue
         if m.group(0).lower() in ADJECTIVE_FORMS and not VERB_OBJECT.match(text, m.end()):
             continue
@@ -1123,17 +1143,20 @@ def _sentence_findings(pieces, filename, emphasis=None, max_sentences=MAX_SENTEN
                        max_words=MAX_WORDS):
     """Flag long sentences, and a paragraph with too many sentences, in one prose block.
 
-    pieces is a list of (lineno, source_column, text, view, ...) tuples. TEXT is the
-    line with code spans and links masked. VIEW is the line as _emphasis_view
-    gives it, at the same length. The texts are joined with spaces, so a
-    sentence wrapped across source lines is counted once, and each finding
-    points at the line and column where it starts. EMPHASIS holds the end
-    offsets of the runs that emphasis uses in the joined views, or None.
-    A block is one paragraph, so the long-paragraph finding counts the
-    sentences of the block that hold a word, and it points at the first word.
-    A block of a table cell or a heading is no paragraph (piece[7] is True).
-    SOURCE (piece[8]) is the line before the masks, at the same length as TEXT.
-    Each finding has an excerpt of it.
+    PIECES is a list of (lineno, source_column, text, view, paragraph, wraps,
+    unsure, no_paragraph, source) tuples. TEXT is the line with code spans and
+    links masked. VIEW is the line as _emphasis_view gives it, at the same
+    length. SOURCE is the line before the masks, at the same length as TEXT.
+    EMPHASIS holds the end offsets of the runs that emphasis uses in the joined
+    views, or None.
+
+    The texts are joined with spaces. So a sentence that wraps over source
+    lines counts once, and each finding points at the line and column where it
+    starts. Each finding has an excerpt of SOURCE.
+
+    A block is one paragraph. The long-paragraph finding counts the sentences
+    of the block that hold a word, and it points at the first word. A block of
+    a table cell or a heading (NO_PARAGRAPH) is no paragraph.
     """
     offsets, position = [], 0
     for piece in pieces:
@@ -1300,15 +1323,16 @@ def _fence_step(fence, line):
 def _math_step(math, line):
     """Return (in_math, math) for LINE, the text of a line after its quote prefix.
 
-    MATH is True when a "$$" math block is open before LINE. A line that starts
-    with "$$" opens a block, and the next line with "$$" ends it. A block can
-    open and end on one line ("$$x^2$$"). GitHub shows the block as math, not as
-    prose.
+    MATH is True when a "$$" math block is open before LINE. A "$$" alone on
+    its line opens a block, and so does a "$$" right before the math ("$$x^2").
+    The next line with "$$" ends the block. A block can open and end on one
+    line ("$$x^2$$"). GitHub shows the block as math, not as prose. A "$$"
+    before a space is text: "$$ is the PID of the shell".
     """
     stripped = line.strip()
     if math:
         return True, "$$" not in stripped
-    if stripped.startswith("$$"):
+    if stripped == "$$" or (stripped.startswith("$$") and not stripped[2].isspace()):
         return True, "$$" not in stripped[2:]
     return False, False
 
@@ -1399,10 +1423,10 @@ def _nested_item(line, parents):
     """Match LINE as a list item with four or more spaces of indent, or return None.
 
     PARENTS are the content indents of the open list items, outermost first. The
-    marker starts an item in the deepest open item that its indent keeps open: at
-    the content indent of that item or after it, and less than four columns after
-    it (CommonMark 5.2). A deeper marker is indented code. Outside a list item,
-    the marker line is indented code or a lazy line.
+    marker starts an item in the deepest open item that its indent keeps open.
+    Its indent is at the content indent of that item or more, and less than four
+    columns more (CommonMark 5.2). A deeper marker is indented code. Outside a
+    list item, the marker line is indented code or a lazy line.
     """
     item = DEEP_ITEM_START.match(line)
     if not item or len(item.group("indent")) < 4:
@@ -2064,8 +2088,8 @@ def _unescape_rust_string(raw, raw_start, is_raw, pos):
 
     RAW_START is the source index of RAW, and POS maps a source index to
     (lineno, col0). A "\\n" escape and a real line end start a new line. A
-    backslash before a line end joins the lines, and the spaces at the start of
-    the next line go away, as rustc does. Another escape becomes one character,
+    backslash before a line end joins the lines, and, as rustc does, drops the
+    spaces at the start of the next line. Another escape becomes one character,
     so a column after an escape can be wrong by a few characters.
     """
     out, text, begin = [], [], None
@@ -2114,12 +2138,14 @@ def _unescape_rust_string(raw, raw_start, is_raw, pos):
 def _rust_blocks(src, parts):
     """Read the prose of Rust source SRC into blocks, and skip the code.
 
-    PARTS selects the prose (see RUST_PARTS). A block is {"kind", "lines"}, and
-    its lines are (lineno, col0, text): the text after the comment marker, with
-    the 0-based source column where it starts. Consecutive standalone comment
-    lines of one kind form one block. A `//` block also needs one indent. A
-    string literal is a block of its own. A string in a call of MESSAGE_CALLEES
-    is a message, and another string with three or more words is a string.
+    PARTS selects the prose (see RUST_PARTS). A block is {"kind", "lines"}. Each
+    of its lines is (lineno, col0, text). TEXT follows the comment marker, and
+    COL0 is the 0-based source column where TEXT starts.
+
+    Consecutive standalone comment lines of one kind form one block. A `//`
+    block also needs one indent. A string literal is a block of its own. A
+    string in a call of MESSAGE_CALLEES is a message, and another string with
+    three or more words is a string.
     """
     line_starts = [0] + [k + 1 for k, char in enumerate(src) if char == "\n"]
 
@@ -2271,20 +2297,23 @@ def _rust_blocks(src, parts):
     return blocks
 
 
-def _lint_rust(text, filename, parts, max_sentences, max_words, max_words_strict, enabled,
+def _lint_rust(text, filename, parts, max_sentences, max_words, max_words_strict, rules,
                seen_synonyms):
-    """Lint the prose of Rust source TEXT. Return (findings, words).
+    """Lint the prose of Rust source TEXT with RULES. Return (findings, words).
 
-    Each block of _rust_blocks is a Markdown document of its own, so a fence
+    Each block of _rust_blocks is a Markdown document of its own. So a fence
     that a block does not close ends with the block. The findings get the
-    source lines and columns. SEEN_SYNONYMS is shared by all blocks, so
-    synonym rotation reads the whole file. A message gets the strict word cap,
-    and a format argument in a message or a string counts as one word.
+    source lines and columns.
+
+    SEEN_SYNONYMS is shared by all blocks, so synonym rotation reads the whole
+    file. A message gets the strict word cap. In a message or a string, a format
+    argument counts as one word.
     """
     findings, words_total = [], 0
     for block in _rust_blocks(text, parts):
         lines = block["lines"]
-        contents = [content for _, _, content in lines]
+        # A "\r" in a string literal is no line end of the block.
+        contents = [content.replace("\r", " ") for _, _, content in lines]
         if block["kind"] in ("messages", "strings"):
             contents = [FORMAT_ARG.sub(lambda m: "X" + " " * (len(m.group(0)) - 1), content)
                         for content in contents]
@@ -2292,7 +2321,7 @@ def _lint_rust(text, filename, parts, max_sentences, max_words, max_words_strict
         found, words = _lint_markdown(
             "\n".join(contents), filename, max_sentences,
             max_words_strict if block["kind"] == "messages" else max_words,
-            enabled, seen_synonyms, front_matter=False)
+            rules, seen_synonyms, front_matter=False)
         for f in found:
             lineno, col0, _ = lines[f["line"] - 1]
             f["line"], f["col"] = lineno, col0 + f["col"]
@@ -2305,25 +2334,37 @@ def _lint_rust(text, filename, parts, max_sentences, max_words, max_words_strict
     return findings, words_total
 
 
+# Characters that str.splitlines reads as line ends, but an editor does not.
+LINE_SEPARATORS = str.maketrans({char: " " for char in "\v\f\x1c\x1d\x1e\x85  "})
+
+
 def lint(text, filename="<stdin>", max_sentences=MAX_SENTENCES, max_words=MAX_WORDS,
-         enabled=(), lang=None, parts=None, max_words_strict=MAX_WORDS_STRICT):
+         enabled=(), lang=None, parts=None, max_words_strict=MAX_WORDS_STRICT, disabled=()):
     """Return (findings, words) for TEXT.
 
-    ENABLED holds the IDs of the opt-in rules to run. LANG is "markdown" or
-    "rust". None reads a "*.rs" FILENAME as Rust. PARTS selects the prose of a
-    Rust file (default: docs and comments).
+    ENABLED holds the IDs of the opt-in rules to run, and DISABLED the IDs of
+    the rules to skip. LANG is "markdown" or "rust". None reads a "*.rs"
+    FILENAME as Rust. PARTS selects the prose of a Rust file (default: docs and
+    comments).
+
+    A line separator other than "\\n" and "\\r" becomes a space, so the line
+    numbers are those of an editor.
     """
+    text = text.translate(LINE_SEPARATORS)
     if lang is None:
         lang = "rust" if filename.endswith(".rs") else "markdown"
     seen_synonyms = {}
+    rules = [rule for rule in RULES + [rule for rule in OPTIONAL_RULES if rule[0] in enabled]
+             if rule[0] not in disabled]
     if lang == "rust":
         findings, words_total = _lint_rust(
             text, filename, set(parts or ("docs", "comments")), max_sentences, max_words,
-            max_words_strict, enabled, seen_synonyms)
+            max_words_strict, rules, seen_synonyms)
     else:
         findings, words_total = _lint_markdown(text, filename, max_sentences, max_words,
-                                               enabled, seen_synonyms)
+                                               rules, seen_synonyms)
     findings.extend(_synonym_findings(seen_synonyms, filename))
+    findings = [f for f in findings if f["rule"] not in disabled]
     findings.sort(key=lambda f: (f["line"], f["col"]))
     return findings, words_total
 
@@ -2347,15 +2388,14 @@ def _synonym_findings(seen_synonyms, filename):
     return findings
 
 
-def _lint_markdown(text, filename, max_sentences, max_words, enabled, seen_synonyms,
+def _lint_markdown(text, filename, max_sentences, max_words, rules, seen_synonyms,
                    front_matter=True):
     """Lint the Markdown TEXT. Return (findings, words) without synonym rotation.
 
-    ENABLED holds the IDs of the opt-in rules to run. The first occurrence of
-    each synonym-group member goes into SEEN_SYNONYMS (see _synonym_findings).
-    FRONT_MATTER: read a YAML front matter at the start of TEXT.
+    RULES are the entries of RULES and OPTIONAL_RULES to run on each line. The
+    first occurrence of each synonym-group member goes into SEEN_SYNONYMS (see
+    _synonym_findings). FRONT_MATTER: read a YAML front matter at the start of TEXT.
     """
-    rules = RULES + [rule for rule in OPTIONAL_RULES if rule[0] in enabled]
     text, description = _front_matter(text) if front_matter else (text, [])
     findings = []
     words_total = 0
@@ -2401,6 +2441,20 @@ def _lint_markdown(text, filename, max_sentences, max_words, enabled, seen_synon
             blocks.append(block[:])
         block.clear()
 
+    def next_words(lineno):
+        """Return " " and the first words of line LINENO + 1, or "".
+
+        The words come only from a text line of the same paragraph. A blank line,
+        a list item, a heading, a fence and an underline give no words.
+        """
+        if lineno >= len(lines):
+            return ""
+        rest = _strip_quotes(lines[lineno].expandtabs(4))[1]
+        if (not rest.strip() or NO_PARAGRAPH.match(rest) or ANY_LIST_ITEM.match(rest)
+                or CODE_FENCE.match(rest.lstrip()) or SETEXT_UNDERLINE.match(rest)):
+            return ""
+        return " " + " ".join(rest.split()[:4])
+
     def check(lineno, segment, source_column, line, skip, is_table,
               add_to_block=True, hidden=(), wraps=False, unsure=False, no_paragraph=False):
         """Lint one line. NO_PARAGRAPH: the line is a block that is no paragraph
@@ -2408,15 +2462,21 @@ def _lint_markdown(text, filename, max_sentences, max_words, enabled, seen_synon
         nonlocal words_total
         words_total += len(line.split())
         lead = block[-1][2] + " " if block else ""  # the line before, in this paragraph
+        # A phrasal verb can wrap: "takes it" / "down". So the particle rule also reads
+        # the first words of the next line, but a match must start on this line.
+        peek = "" if is_table else next_words(lineno)
         phrasal = []  # the (start, end) of each phrasal-verb finding on the line
         for rule_id, level, pattern, msg in rules:
             # One phrasal verb gives one finding. RULES has the soft list first, then the
             # particle rule, then the technical rule. The spans of the earlier rules do
-            # not overlap, so the span with the last start before a match end is the
-            # only one that can overlap the match.
+            # not overlap. So only one of them can overlap a match: the span with the
+            # last start before the end of the match.
             earlier = sorted(phrasal)
             earlier_starts = [start for start, _ in earlier]
-            for m in pattern.finditer(line):
+            text = line + peek if rule_id == "phrasal-verb-particle" else line
+            for m in pattern.finditer(text):
+                if m.start() >= len(line):
+                    break
                 # the modal may end the line before: "may" / "have failed"
                 if (rule_id == "present-perfect"
                         and MODAL_PERFECT_PREFIX.search(lead + line[skip:m.start()])):
@@ -2442,7 +2502,7 @@ def _lint_markdown(text, filename, max_sentences, max_words, enabled, seen_synon
             for base in group:
                 if (gi, base) in seen_synonyms:
                     continue
-                m = _verb_match(_word_re(base), named, lead)
+                m = _verb_match(base, named, lead)
                 if m:
                     seen_synonyms[(gi, base)] = (
                         lineno, source_column + m.start() + 1, m.group(0)
@@ -2548,7 +2608,10 @@ def _lint_markdown(text, filename, max_sentences, max_words, enabled, seen_synon
         underline = (in_paragraph and depth == paragraph_depth
                      and _indent_width(unquoted) >= list_indent
                      and SETEXT_UNDERLINE.match(unquoted))
-        in_paragraph = bool(unquoted.strip() and not in_html and not is_fence and not fence
+        if underline:
+            # The underline makes the open paragraph a heading, which is no paragraph.
+            block[:] = [piece[:7] + (True,) + piece[8:] for piece in block]
+        in_paragraph =bool(unquoted.strip() and not in_html and not is_fence and not fence
                             and not NO_PARAGRAPH.match(unquoted) and not underline)
         if not in_paragraph:
             paragraph_depth = 0
@@ -2693,7 +2756,9 @@ def _lint_markdown(text, filename, max_sentences, max_words, enabled, seen_synon
                 lineno, segment, source_column, line, skip, is_table,
                 add_to_block=not admonition_title, hidden=hidden,
                 wraps=not (in_html or is_table) and _html_item_wraps(segment, line, hidden, skip),
-                unsure=unsure or unsure_list, no_paragraph=is_table or bool(standalone),
+                unsure=unsure or unsure_list,
+                # a heading can follow a list marker: "- # Title"
+                no_paragraph=is_table or bool(standalone or NO_PARAGRAPH.match(item_text)),
             )
             if is_table:
                 flush()  # each table cell is its own block
@@ -3833,7 +3898,7 @@ def selftest():
         assert [line.split() for line in lines[1:3]] == [
             ["2", "1", "7", paths[1]], ["1", "0", "30", paths[0]]], lines
         assert lines[4].split() == ["0", "1", "7", paths[1]], lines
-        # --enable turns on an opt-in rule, and repeated flags add up
+        # --enable runs an opt-in rule, and repeated flags add up
         with open(paths[1], "w", encoding="utf-8") as fh:
             fh.write("It no longer runs.\n")
         with contextlib.redirect_stdout(io.StringIO()):
@@ -4055,6 +4120,38 @@ def selftest():
     findings, _ = lint(doc, filename="a.rs")
     assert [(f["rule"], f["line"]) for f in findings] == [
         ("synonym-rotation", 4), ("semicolon", 4)], findings
+    # A form feed or a Unicode line separator is a space: the line numbers stay those of an editor.
+    findings, _ = lint("/// a\fb; c\nfn f() {}\n", filename="a.rs")
+    assert [(f["rule"], f["line"], f["col"]) for f in findings] == [("semicolon", 1, 8)], findings
+    findings, _ = lint("a b; c\n")
+    assert [(f["rule"], f["line"]) for f in findings] == [("semicolon", 1)], findings
+    # "$$" opens a math block only alone on its line or right before the math.
+    findings, _ = lint("$$ is the PID of the shell; it varies.\n\nProse; here.")
+    assert [f["line"] for f in findings if f["rule"] == "semicolon"] == [1, 3], findings
+    # A link definition has a destination and an optional title, and nothing more.
+    findings, _ = lint("[Warning]: do not run this; it deletes data.")
+    assert [f["rule"] for f in findings] == ["semicolon"], findings
+    findings, _ = lint('[x]: <a b;c> \'t; u\'\n[y]: http://a.b/c;d (t; u)\n\nProse; here.')
+    assert [(f["rule"], f["line"]) for f in findings] == [("semicolon", 4)], findings
+    # After "this" or "that", a verb form is a verb, and only the bare word is a noun.
+    for text in ("Fetch the file. This retrieves the key.",
+                 "Fetch the file. The step that retrieves the key."):
+        findings, _ = lint(text)
+        assert [f["match"] for f in findings if f["rule"] == "synonym-rotation"] == ["retrieves"], findings
+    findings, _ = lint("Start the job. This launch is slow.")
+    assert not any(f["rule"] == "synonym-rotation" for f in findings), findings
+    # The particle rule reads the start of the next line of the paragraph.
+    findings, _ = lint("The reader goes down\nthe list. The run takes up\nto five seconds. It "
+                       "takes it\ndown to the backend. It goes\n\n- down the hill.")
+    assert [(f["line"], f["match"]) for f in findings if f["rule"] == "phrasal-verb-particle"] == [
+        (3, "takes it down")], findings
+    # A heading in a list item and a setext heading are no paragraphs.
+    for text in ("- # " + seven, seven + "\n---", "> " + seven + "\n> ==="):
+        findings, _ = lint(text)
+        assert not any(f["rule"] == "long-paragraph" for f in findings), (text, findings)
+    # A disabled rule does not hide the words of another rule.
+    findings, _ = lint("She came up with a plan.", disabled={"phrasal-verb"})
+    assert [f["rule"] for f in findings] == ["phrasal-verb-particle"], findings
     # --lang rust reads stdin as Rust. --parts takes known parts only.
     stdin, out = sys.stdin, io.StringIO()
     try:
@@ -4064,7 +4161,8 @@ def selftest():
     finally:
         sys.stdin = stdin
     assert "<stdin>:1:15 semicolon" in out.getvalue(), out.getvalue()
-    for bad in (["--parts", "docs,code"], ["--lang", "c"], ["--max-words-strict", "0"]):
+    for bad in (["--parts", "docs,code"], ["--lang", "c"], ["--max-words-strict", "0"],
+                ["--summary", "--json"]):
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 main(bad)
@@ -4121,7 +4219,11 @@ def main(argv):
         description="Deterministic linter for the structural STE rules. "
                     "Reads stdin when no FILE is given.")
     parser.add_argument("paths", nargs="*", metavar="FILE")
-    parser.add_argument("--json", action="store_true", help="print findings as JSON")
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true", help="print findings as JSON")
+    output.add_argument("--summary", action="store_true",
+                        help="print one line per file (hard, advisory, words), "
+                             "the most hard violations first")
     parser.add_argument("--baseline", type=_non_negative_int, default=0, metavar="N",
                         help="pass unless hard violations exceed N (default 0)")
     parser.add_argument("--disable", type=_rule_list, action="append", default=[],
@@ -4129,7 +4231,8 @@ def main(argv):
                         help="comma-separated rule IDs to silence; may be repeated")
     parser.add_argument("--enable", type=_optional_rule_list, action="append", default=[],
                         metavar="RULES",
-                        help="comma-separated opt-in rule IDs to run (history); may be repeated")
+                        help="comma-separated opt-in rule IDs to run (history). Repeat the "
+                             "flag to add more")
     parser.add_argument("--max-words", type=_positive_int, default=MAX_WORDS, metavar="N",
                         help=f"the words of one sentence, at most (default {MAX_WORDS})")
     parser.add_argument("--max-sentences", type=_positive_int, default=MAX_SENTENCES,
@@ -4145,9 +4248,6 @@ def main(argv):
                         metavar="N",
                         help=f"the words of one sentence in a Rust message, at most "
                              f"(default {MAX_WORDS_STRICT})")
-    parser.add_argument("--summary", action="store_true",
-                        help="print one line per file (hard, advisory, words), "
-                             "the most hard violations first")
     parser.add_argument("--selftest", action="store_true", help="run the built-in tests")
     # intermixed parsing keeps flags valid between file paths
     args = parser.parse_intermixed_args(argv)
@@ -4173,8 +4273,8 @@ def main(argv):
                 parser.error(f"cannot read {p}: {e}")
         found, words = lint(text, filename=p, max_sentences=args.max_sentences,
                             max_words=args.max_words, enabled=enabled, lang=args.lang,
-                            parts=args.parts, max_words_strict=args.max_words_strict)
-        found = [f for f in found if f["rule"] not in disabled]
+                            parts=args.parts, max_words_strict=args.max_words_strict,
+                            disabled=disabled)
         hard = sum(1 for f in found if f["level"] == "advisory-free")
         per_file.append((p, hard, len(found) - hard, words))
         findings.extend(found)
