@@ -91,7 +91,9 @@ These six habits cover most of what makes machine-written English hard to parse.
 2. Read the input text once for meaning — do not start rewriting before you understand what it must still say afterward.
 3. Walk it sentence by sentence. Flag every rule violation from the Core Rewrite Rules tables and every habit from the Scan Checklist. In STE-flavored mode, flag the lexical rules but do not enforce them. That choice is for the rewrite. The linter has no flavored mode, and synonym rotation stays a hard finding. Pass `--disable synonym-rotation` to drop it.
 
-   For a mechanical first pass over the structural rules, run `scripts/ste-lint.py` (stdin or file args, `--json` for structured output). It checks semicolons, sentence length, paragraph length, phrasal verbs, nominalization, marketing adjectives, synonym rotation and dangling conjunctions in supported list items. The phrasal-verb rules also read a common verb and a particle, with or without a pronoun between them. As advisory findings, it also flags passive voice, compound tenses, em dashes and technical phrasal verbs (set up, back up, shut down). By design, it never flags hedges or modality. Its options:
+   For a mechanical first pass over the structural rules, run `scripts/ste-lint.py` (stdin or file args, `--json` for structured output). It checks semicolons, sentence length, paragraph length, phrasal verbs, nominalization, marketing adjectives, synonym rotation and dangling conjunctions in supported list items. The phrasal-verb rules also read a common verb and a particle, with or without a pronoun between them. Six pairs (run out, run into, blow up, cut off, carry out, give up) also give a finding before a determiner. A noun can also stand between their two words.
+
+   As advisory findings, it also flags passive voice, compound tenses, em dashes and technical phrasal verbs (set up, back up, shut down). By design, it never flags hedges or modality. Its options:
 
    - `--baseline N` tolerates N hard violations (for adopting on existing docs).
    - `--disable rule1,rule2` silences named rules.

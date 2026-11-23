@@ -126,13 +126,48 @@ def _technical_particles(forms):
             if verb & set(technical.split("|")) for particle in particles.split("|")}
 
 
+# Pairs of a verb and a particle that are a phrasal verb also before a determiner:
+# "runs into a wall", "cuts off the graph". Each entry holds the forms of one verb,
+# its particle and the plain verbs of its message. The rule tries these pairs
+# first, then the verbs of PARTICLE_VERBS. A pronoun or a noun can stand between the
+# verb and the particle: "cuts it off", "cuts the graph off".
+#
+# "Up to" after a pair is no exception: "gives up to five slots" can also read as
+# the phrasal verb. "run over" is not in the list: "a scan runs over the row" means
+# "iterates over the row". Limit: the verb form can be a noun ("the pre-reset run
+# into", "two runs out of ten"), and then it gives a finding.
+PARTICLE_PAIRS = [
+    ("run|runs|ran|running", "out", "end, stop"),
+    ("run|runs|ran|running", "into", "hit, meet"),
+    ("blow|blows|blew|blowing|blown", "up", "diverge, increase"),
+    ("cut|cuts|cutting", "off", "cut, remove, stop"),
+    ("carry|carries|carried|carrying", "out", "do, apply"),
+    ("give|gives|gave|giving|given", "up", "stop, release"),
+]
+# The words between the verb and the particle of a pair: a pronoun, or a noun of
+# one word, or of two words after a determiner ("a carried cache").
+_PAIR_OBJECT = rf"(?:{_PRONOUN}|(?:(?:{_DETERMINER})\s+(?:\w+\s+)?)?\w+)"
+# The name of the regex group of each pair, and the plain verbs of its message.
+_PAIR_VERBS = {f"pair{index}": verbs for index, (_, _, verbs) in enumerate(PARTICLE_PAIRS)}
+
 PHRASAL_VERB_PARTICLE = re.compile(
     r"\b(?:" + "|".join(
+        rf"(?P<{name}>(?:{forms})\s+(?:{_PAIR_OBJECT}\s+)?{particle}\b)"
+        for name, (forms, particle, _) in zip(_PAIR_VERBS, PARTICLE_PAIRS))
+    + "|(?:" + "|".join(
         rf"(?:{forms})\s+(?:(?:{_PRONOUN})\s+)?"
         + _particle_re(p for p in PARTICLES if p not in _technical_particles(forms))
         for forms in PARTICLE_VERBS)
-    + r")(?:\s+" + _particle_re(PARTICLES) + ")?", re.I)
+    + r")(?:\s+" + _particle_re(PARTICLES) + ")?)", re.I)
 
+
+def _particle_message(match):
+    """Return the message of a MATCH of PHRASAL_VERB_PARTICLE."""
+    verbs = _PAIR_VERBS.get(match.lastgroup, "move, return, leave, decrease")
+    return f"Phrasal verb (Rule 9.3). Use one plain verb ({verbs})."
+
+
+# Each rule is (ID, level, pattern, message). A message can be a function of the match.
 RULES = [
     ("semicolon", "advisory-free",
      re.compile(r";"),
@@ -144,8 +179,7 @@ RULES = [
                 r"|look(?:s|ed|ing)? into|sort(?:s|ed|ing)? out)\b", re.I),
      "Soft phrasal verb. Use the single plain verb (start, contact, read, begin)."),
     ("phrasal-verb-particle", "advisory-free",
-     PHRASAL_VERB_PARTICLE,
-     "Phrasal verb (Rule 9.3). Use one plain verb (move, return, leave, decrease)."),
+     PHRASAL_VERB_PARTICLE, _particle_message),
     ("phrasal-verb-technical", "advisory",
      PHRASAL_VERB_TECHNICAL,
      "Possible phrasal verb (Rule 9.3). If it is not a fixed technical term, use one plain verb."),
@@ -2495,7 +2529,8 @@ def _lint_markdown(text, filename, max_sentences, max_words, rules, seen_synonym
                 findings.append({"file": filename, "line": lineno,
                                  "col": source_column + m.start() + 1,
                                  "rule": rule_id, "level": level,
-                                 "match": m.group(0), "message": msg})
+                                 "match": m.group(0),
+                                 "message": msg(m) if callable(msg) else msg})
         # Blank file names with spaces of the same length, so columns stay true.
         named = FILE_NAME.sub(lambda found: " " * len(found.group(0)), line)
         for gi, group in enumerate(SYNONYM_GROUPS):
@@ -4024,6 +4059,69 @@ def selftest():
     # "this" and "that" can be the subject.
     findings, _ = lint("This goes down.")
     assert [f["match"] for f in findings if f["rule"] == "phrasal-verb-particle"] == ["goes down"], findings
+    # The repro of the missed pairs. A pair of PARTICLE_PAIRS is hard, also before a
+    # determiner ("cuts off the graph"). "go back" of PARTICLE_VERBS stays hard, and a
+    # technical pair ("picks up") stays advisory.
+    findings, _ = lint("\n\n".join((
+        "A loop sees it go back to the first batch.", "The session goes back to the first batch.",
+        "A loop sees it run out when it checks the budget.",
+        "The budget runs out after 600 training steps.", "The budget ran out at the last epoch.",
+        "The loop runs out of batches.", "A loop sees the budget run out.",
+        "The loop runs into a wall.", "The gradient blows up at step 10.",
+        "The detach cuts off the graph.", "The batcher carries out the padding.",
+        "The session gives up the lock.", "The loop picks up the next batch.")))
+    assert [(f["line"], f["rule"], f["match"], f["level"]) for f in findings
+            if f["rule"].startswith("phrasal")] == [
+        (1, "phrasal-verb-particle", "go back", "advisory-free"),
+        (3, "phrasal-verb-particle", "goes back", "advisory-free"),
+        (5, "phrasal-verb-particle", "run out", "advisory-free"),
+        (7, "phrasal-verb-particle", "runs out", "advisory-free"),
+        (9, "phrasal-verb-particle", "ran out", "advisory-free"),
+        (11, "phrasal-verb-particle", "runs out", "advisory-free"),
+        (13, "phrasal-verb-particle", "run out", "advisory-free"),
+        (15, "phrasal-verb-particle", "runs into", "advisory-free"),
+        (17, "phrasal-verb-particle", "blows up", "advisory-free"),
+        (19, "phrasal-verb-particle", "cuts off", "advisory-free"),
+        (21, "phrasal-verb-particle", "carries out", "advisory-free"),
+        (23, "phrasal-verb-particle", "gives up", "advisory-free"),
+        (25, "phrasal-verb-technical", "picks up", "advisory")], findings
+    # Each form of the verb of a pair gives a finding.
+    findings, _ = lint("They are running out. It has run into a limit. It blew up. They blow up. "
+                       "The loss is blowing up. The norm has blown up. Cut off the tail. It is "
+                       "cutting off the graph. The loop carried out the step. It is carrying out "
+                       "the step. Carry out the step. It gave up. They are giving up. It has "
+                       "given up. Give up the lock.")
+    assert [f["match"] for f in findings if f["rule"] == "phrasal-verb-particle"] == [
+        "running out", "run into", "blew up", "blow up", "blowing up", "blown up", "Cut off",
+        "cutting off", "carried out", "carrying out", "Carry out", "gave up", "giving up",
+        "given up", "Give up"], findings
+    # A pronoun or a noun can stand between the verb and the particle of a pair. A
+    # noun has at most two words after a determiner, and one word without it.
+    findings, _ = lint("The detach cuts it off. It cuts the graph off. Cut a carried cache off "
+                       "the graph. It cuts gradients off. The batcher carries the padding out. "
+                       "The session gives the lock up. It blows the loss up. It runs them into "
+                       "a wall. It cuts the\ngraph off.")
+    assert [(f["line"], f["match"]) for f in findings if f["rule"] == "phrasal-verb-particle"] == [
+        (1, "cuts it off"), (1, "cuts the graph off"), (1, "Cut a carried cache off"),
+        (1, "cuts gradients off"), (1, "carries the padding out"), (1, "gives the lock up"),
+        (1, "blows the loss up"), (1, "runs them into"), (1, "cuts the graph off")], findings
+    # "run over" is no pair. A noun of three words after a determiner is too long for
+    # the object of a pair.
+    for text in ("A scan runs over the row.", "Cut the old carried cache off the graph."):
+        findings, _ = lint(text)
+        assert not any(f["rule"] == "phrasal-verb-particle" for f in findings), (text, findings)
+    # "Up to" after a pair is no exception, unlike "takes up to five seconds".
+    findings, _ = lint("The loss blows up to NaN. The team gives up to five slots. "
+                       "The state given the tokens up to t.")
+    assert [f["match"] for f in findings if f["rule"] == "phrasal-verb-particle"] == [
+        "blows up", "gives up", "given the tokens up"], findings
+    # The message of a pair gives the plain verbs of that pair.
+    findings, _ = lint("It goes back.\n\nIt runs out.\n\nIt runs into a wall.\n\nIt blows up."
+                       "\n\nIt cuts off the graph.\n\nIt carries out the step.\n\nIt gives up.")
+    assert [f["message"] for f in findings if f["rule"] == "phrasal-verb-particle"] == [
+        f"Phrasal verb (Rule 9.3). Use one plain verb ({verbs})." for verbs in (
+            "move, return, leave, decrease", "end, stop", "hit, meet", "diverge, increase",
+            "cut, remove, stop", "do, apply", "stop, release")], findings
     # More soft phrasal verbs. The soft list wins where the two lists match the same words.
     findings, _ = lint("We figured out the cause. Find out more. Point out the bug. It ended up "
                        "empty. Look into it. Sort out the data. Get rid of it. She came up with a plan.")
