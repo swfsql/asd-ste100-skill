@@ -408,6 +408,12 @@ def _verb_match(base, text, lead=""):
     return None
 
 
+def _first_words(text):
+    """Return " " and the first four words of TEXT: the words that a rule reads
+    after the end of a line."""
+    return " " + " ".join(text.split()[:4])
+
+
 def _count_words(text):
     """Count whitespace-separated tokens that contain a letter or a digit.
 
@@ -2479,26 +2485,32 @@ def _lint_markdown(text, filename, max_sentences, max_words, rules, seen_synonym
         """Return " " and the first words of line LINENO + 1, or "".
 
         The words come only from a text line of the same paragraph. A blank line,
-        a list item, a heading, a fence and an underline give no words.
+        a list item, a heading, a fence, an underline and a deeper quote give no
+        words. A line with fewer ">" is a lazy line of the paragraph.
         """
         if lineno >= len(lines):
             return ""
-        rest = _strip_quotes(lines[lineno].expandtabs(4))[1]
-        if (not rest.strip() or NO_PARAGRAPH.match(rest) or ANY_LIST_ITEM.match(rest)
-                or CODE_FENCE.match(rest.lstrip()) or SETEXT_UNDERLINE.match(rest)):
+        depth, rest = _strip_quotes(lines[lineno].expandtabs(4))
+        if (depth > paragraph_depth or not rest.strip() or NO_PARAGRAPH.match(rest)
+                or ANY_LIST_ITEM.match(rest) or CODE_FENCE.match(rest.lstrip())
+                or SETEXT_UNDERLINE.match(rest)):
             return ""
-        return " " + " ".join(rest.split()[:4])
+        return _first_words(rest)
 
-    def check(lineno, segment, source_column, line, skip, is_table,
+    def check(lineno, segment, source_column, line, skip, peek,
               add_to_block=True, hidden=(), wraps=False, unsure=False, no_paragraph=False):
-        """Lint one line. NO_PARAGRAPH: the line is a block that is no paragraph
-        (a table cell or a heading), so the long-paragraph rule skips it."""
+        """Lint one line. PEEK is the text that the rules read after the line: " "
+        and the first words of the next line of its paragraph, or "". NO_PARAGRAPH:
+        the line is a block that is no paragraph (a table cell or a heading), so the
+        long-paragraph rule skips it."""
         nonlocal words_total
         words_total += len(line.split())
         lead = block[-1][2] + " " if block else ""  # the line before, in this paragraph
-        # A phrasal verb can wrap: "takes it" / "down". So the particle rule also reads
-        # the first words of the next line, but a match must start on this line.
-        peek = "" if is_table else next_words(lineno)
+        # The words of a rule can wrap: "takes it" / "down", "are" / "decompressed". So
+        # each rule also reads PEEK, but a match must start on this line. The spaces at
+        # the end of the line (a hard line break) are no gap between the words.
+        line_end = len(segment.rstrip())
+        text = line[:line_end] + peek
         phrasal = []  # the (start, end) of each phrasal-verb finding on the line
         for rule_id, level, pattern, msg in rules:
             # One phrasal verb gives one finding. RULES has the soft list first, then the
@@ -2507,9 +2519,8 @@ def _lint_markdown(text, filename, max_sentences, max_words, rules, seen_synonym
             # last start before the end of the match.
             earlier = sorted(phrasal)
             earlier_starts = [start for start, _ in earlier]
-            text = line + peek if rule_id == "phrasal-verb-particle" else line
             for m in pattern.finditer(text):
-                if m.start() >= len(line):
+                if m.start() >= line_end:
                     break
                 # the modal may end the line before: "may" / "have failed"
                 if (rule_id == "present-perfect"
@@ -2573,8 +2584,11 @@ def _lint_markdown(text, filename, max_sentences, max_words, rules, seen_synonym
             piece_end = None
         line = _mask_non_prose(masked, hidden)
         piece_depth = _gfm_autolinks(value, line, 0, piece_depth, hidden)
-        check(index + 1, value, column, line, 0, False, hidden=hidden,
-              wraps=_html_item_wraps(value, line, hidden, 0))
+        # A code span that is open at the end of a piece hides the words of the next piece.
+        last = position + 1 == len(values)
+        check(index + 1, value, column, line, 0,
+              "" if span or last else _first_words(values[position + 1]),
+              hidden=hidden, wraps=_html_item_wraps(value, line, hidden, 0))
     flush()
     def closes_later(run):
         """True when a run of length RUN closes a span on a later line of this paragraph."""
@@ -2787,13 +2801,16 @@ def _lint_markdown(text, filename, max_sentences, max_words, rules, seen_synonym
                 _gfm_autolinks(segment, line, skip, 0, hidden)
             else:
                 link_depth = _gfm_autolinks(segment, line, skip, link_depth, hidden)
+            # a heading can follow a list marker: "- # Title"
+            no_paragraph = is_table or bool(standalone or NO_PARAGRAPH.match(item_text))
+            # A block that is no paragraph has no next line in its paragraph. A code span
+            # that is open at the end of a line hides the words of the next line.
             check(
-                lineno, segment, source_column, line, skip, is_table,
+                lineno, segment, source_column, line, skip,
+                "" if no_paragraph or open_span else next_words(lineno),
                 add_to_block=not admonition_title, hidden=hidden,
                 wraps=not (in_html or is_table) and _html_item_wraps(segment, line, hidden, skip),
-                unsure=unsure or unsure_list,
-                # a heading can follow a list marker: "- # Title"
-                no_paragraph=is_table or bool(standalone or NO_PARAGRAPH.match(item_text)),
+                unsure=unsure or unsure_list, no_paragraph=no_paragraph,
             )
             if is_table:
                 flush()  # each table cell is its own block
@@ -4243,6 +4260,71 @@ def selftest():
                        "takes it\ndown to the backend. It goes\n\n- down the hill.")
     assert [(f["line"], f["match"]) for f in findings if f["rule"] == "phrasal-verb-particle"] == [
         (3, "takes it down")], findings
+    # The repro of the line breaks: each rule reads the start of the next line of the
+    # paragraph. A finding gives the line and the column of its first word, and each
+    # rule keeps its kind.
+    wrapped = ("Only the row groups up to the requested rows are\ndecompressed.",
+               "The run has\nfinished.", "The cache is no\nlonger valid.",
+               "The window ends, and then the cursor goes\nback to the first window.",
+               "The cache was\npreviously valid.")
+    wrapped_findings = [
+        (1, 46, "passive-voice", "are decompressed", "advisory"),
+        (4, 9, "present-perfect", "has finished", "advisory"),
+        (7, 14, "history", "no longer", "advisory-free"),
+        (10, 38, "phrasal-verb-particle", "goes back", "advisory-free"),
+        (14, 1, "history", "previously", "advisory-free")]
+    findings, _ = lint("\n\n".join(wrapped), enabled={"history"})
+    assert [(f["line"], f["col"], f["rule"], f["match"], f["level"]) for f in findings
+            ] == wrapped_findings, findings
+    # The same forms in a `///` doc comment and in a `//` comment of a Rust file.
+    docs = "".join("/// " + form.replace("\n", "\n/// ") + f"\nfn f{n}() {{}}\n"
+                   for n, form in enumerate(wrapped))
+    comments = "fn g() {\n" + "".join(
+        "    // " + form.replace("\n", "\n    // ") + f"\n    let x{n} = {n};\n"
+        for n, form in enumerate(wrapped)) + "}\n"
+    for rust, places in ((docs, [(1, 50), (4, 13), (7, 18), (10, 42), (14, 5)]),
+                         (comments, [(2, 53), (5, 16), (8, 21), (11, 45), (15, 8)])):
+        findings, _ = lint(rust, filename="a.rs", enabled={"history"})
+        assert [(f["line"], f["col"], f["rule"], f["match"], f["level"]) for f in findings] == [
+            place + finding[2:] for place, finding in zip(places, wrapped_findings)], findings
+    # The words of two paragraphs, or of two comments with code between them, never match.
+    # The same holds for a heading and its next line, a line and a deeper quote, and a
+    # doc comment and a comment.
+    for text, filename in (("The cache is no\n\nlonger valid.", "a.md"),
+                           ("# The rows are\ndecompressed.", "a.md"),
+                           ("- # The cache is no\n  longer valid.", "a.md"),
+                           ("The cache is no\n> longer valid.", "a.md"),
+                           ("> The cache is no\n> > longer valid.", "a.md"),
+                           ("fn g() {\n    // The cache is no\n    let x = 1;\n"
+                            "    // longer valid.\n}\n", "a.rs"),
+                           ("/// The cache is no\n// longer valid.\nfn f() {}\n", "a.rs")):
+        findings, _ = lint(text, filename=filename, enabled={"history"})
+        assert findings == [], (text, findings)
+    # A line with fewer ">" is a lazy line of the paragraph.
+    findings, _ = lint("> The cache is no\nlonger valid.", enabled={"history"})
+    assert [(f["line"], f["col"], f["match"]) for f in findings] == [(1, 16, "no longer")], findings
+    # The other rules of two or more words also read the next line.
+    findings, _ = lint("The team will reach\nout to you.\n\nThe agent sets\nup the job.\n\n"
+                       "The team will perform an\nanalysis.\n\nThe tool is blazing\nfast.")
+    assert [(f["line"], f["col"], f["rule"], f["match"], f["level"]) for f in findings] == [
+        (1, 15, "phrasal-verb", "reach out", "advisory-free"),
+        (4, 11, "phrasal-verb-technical", "sets up", "advisory"),
+        (7, 15, "nominalization", "perform an analysis", "advisory-free"),
+        (10, 13, "marketing-adjective", "blazing fast", "advisory-free")], findings
+    # The exception of a rule also reads the next line: "is used for training" is no passive.
+    findings, _ = lint("The cache is used\nfor training models.")
+    assert findings == [], findings
+    # The spaces at the end of a line (a hard line break) do not stop a match.
+    findings, _ = lint("The cache is no  \nlonger valid.", enabled={"history"})
+    assert [(f["line"], f["col"], f["match"]) for f in findings] == [(1, 14, "no longer")], findings
+    # A code span that is open at the end of a line hides the words of the next line.
+    findings, _ = lint("The cache is `x\ndecompressed` here. It takes `x\ndown` now.")
+    assert findings == [], findings
+    # The description of a front matter is one paragraph over its lines.
+    findings, _ = lint("---\ndescription: The cache is no\n  longer valid. The run has\n  finished. "
+                       "It takes `x\n  down` now.\n---\nText.\n", enabled={"history"})
+    assert [(f["line"], f["col"], f["match"]) for f in findings] == [
+        (2, 27, "no longer"), (3, 25, "has finished")], findings
     # A heading in a list item and a setext heading are no paragraphs.
     for text in ("- # " + seven, seven + "\n---", "> " + seven + "\n> ==="):
         findings, _ = lint(text)

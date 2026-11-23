@@ -44,6 +44,8 @@ The deterministic linter checks these patterns:
 - synonym rotation, and dangling conjunctions in supported list items
 - advisory: passive voice, present-perfect forms (also "has run"), em dashes, and technical phrasal verbs (set up, back up, shut down)
 
+The words of one finding can be on two lines of a paragraph or a comment ("are" / "decompressed"). Each rule reads the first four words of the next line, and the finding gives the line and the column of its first word. The words of two paragraphs, or of two comments with code between them, never give one finding. A code span that is open at the end of a line hides the words of the next line.
+
 A table cell or a heading is no paragraph. Synonym rotation reads only verbs. A word after a determiner ("the start", "per launch"), in a hyphen compound, or as an adjective ("fixed shapes") gives no finding. It does not check noun-cluster length (that needs part-of-speech tagging). It never flags hedges or modality.
 
 The linter does not know phrasal verbs outside its lists. A particle before a determiner can be a preposition ("go down the list"), so "take off the panel" passes. Each of the six pairs also gives a finding before a determiner ("cuts off the graph"). The verb form of a pair can be a noun ("the pre-reset run into", "two runs out of ten"), and it gives a false finding.
